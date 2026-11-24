@@ -5,7 +5,7 @@ tokens for Qwen3-8B. This repo asks whether those tokens can carry the one fact 
 types it never trained on, the best pipeline on those tokens acts on the relevant fact in 44% of answers. A perfect
 picker would reach 80%, and a 27B judge reading the facts as text reaches 68%. The two gaps are finding the fact
 among 48 or more others, and a reader that mostly uses the fact only when it comes first. The next step, teaching the
-token rater from the 27B judge, is ready to run. Most of the work was done by an AI agent (Claude) under the
+token rater from the 27B judge, has since been run (see *Since the write-up* below). Most of the work was done by an AI agent (Claude) under the
 author's direction.
 
 - **Write-up:** https://blog.nenkoru.com/posts/memorilla-token-path/ (markdown for agents: `index.md` next to it)
@@ -14,9 +14,33 @@ author's direction.
 - **Weights (LoRAs):** https://huggingface.co/nenkoru/memorilla-token-path-loras
 - **Benchmark, labels and result tables:** https://huggingface.co/datasets/nenkoru/memorilla-buried-clue
 
+## Since the write-up (2026-11-25)
+
+Lab notebook tests 45-47 in [`experiments/AGENTMEM_HYPOTHESES.md`](experiments/AGENTMEM_HYPOTHESES.md).
+
+- **4-bit training on a small GPU budget (tests 45-46).**
+  - The frozen Qwen3-8B is stored in 4 bits (groups of 64, unpacked by a fused Triton kernel), and its layers are
+    streamed from pinned CPU memory one layer ahead of use ([`experiments/q8.py`](experiments/q8.py)).
+  - The block rater now trains in 1.4-1.5 GiB of GPU memory at 4-5 s per step, on a V100 shared with other jobs.
+    Before: 6.3 GiB over two GPUs, 7 s per step.
+  - A LoRA trained on the 4-bit base rates as well as the int8 one.
+- **The rater taught by the 27B (test 47).** The 27B judged 25,096 training (request, fact) pairs. A 16-token rater
+  trained on those labels did better than the 8B-taught one:
+
+  | | clue first of 8 / 16 / 48 | clue in top 4 of 48 |
+  |---|---|---|
+  | 8B-taught rater | 0.51 / 0.33 / 0.23 | 0.43 |
+  | 27B-taught rater | 0.61 / 0.44 / 0.29 | 0.50 |
+  | 27B reading the facts as text | 0.72 / 0.56 / 0.35 | 0.72 |
+
+  It now matches the 8B reading the facts as text. The 27B as text is still clearly ahead.
+- **Not measured yet:** answers (acts) with the new rater's picks. Three runs are going: the current reader on those
+  picks, a reader trained with the clue at a random place among 1-4 blocks, and 2,000 more 27B-labelled requests.
+  The new LoRAs are not on Hugging Face yet.
+
 ## Status
 
-This is research code, published as-is so someone can pick the work up. Nothing is running and nothing is maintained.
+This is research code, published as-is so someone can pick the work up. It is updated now and then, not maintained.
 Results and their caveats are in the report. The lab notebook, with every test numbered, is
 [`experiments/AGENTMEM_HYPOTHESES.md`](experiments/AGENTMEM_HYPOTHESES.md).
 

@@ -31,6 +31,7 @@ import numpy as np  # noqa: E402
 import poc_broad as B  # noqa: E402
 import poc_profile as PF  # noqa: E402
 import poc_whole as W  # noqa: E402
+import q8  # noqa: E402
 
 SIZES = (8, 16, 48)
 WORD = {  # the text wordings of tests 35c and 41 with "the fact above" -> "the fact in your memory"
@@ -93,6 +94,83 @@ def rating_ids(A, tok, add_special, system, user, n_mem):
     return tok.encode(A.apply_chat_template(tok, msgs[:2], add_generation_prompt=True), add_special_tokens=add_special)
 
 
+def qfirst_ids(A, tok, add_special, system, user, n_mem, memory_id):
+    """Rating prompt with the request first and the memory block last (layout "qfirst"): plain system prompt, then the
+    user turn = yes/no question + the 16 memory tokens. Everything before the first memory token depends only on the
+    request, so all facts of a request share it (shared_hidden)."""
+    m = tok.convert_ids_to_tokens(memory_id)
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": f"{user}\n\nMemory{m * n_mem}Memory"}]
+    return tok.encode(A.apply_chat_template(tok, msgs, add_generation_prompt=True), add_special_tokens=add_special)
+
+
+def prompt_ids(A, tok, add_special, memory_id, system, user, layout):
+    """(prefix, suffix) token ids, split at the first memory token. layout "sys": memory in the system prompt (the
+    original); "qfirst": request first, memory last."""
+    ids = rating_ids(A, tok, add_special, system, user, 16) if layout == "sys" else qfirst_ids(A, tok, add_special, system, user, 16, memory_id)
+    k = ids.index(memory_id)
+    return ids[:k], ids[k:]
+
+
+def shared_hidden(model, pre, suf, grp, every=False):
+    """Final hidden state at the last position of each suffix, every suffix reading after its group's prefix.
+
+    pre: G prefix embeddings [Lp_g, dim]; suf: M suffix embeddings [Ls_m, dim]; grp[m]: the prefix of suffix m.
+    Each prefix is computed once and its keys/values are shared by its suffixes (a training-time prefix cache).
+    Tokens stay one flat matrix for every projection, so each 4-bit weight is unpacked once per pass for all of them;
+    only attention is split. Right padding, positions counted from each row's first real token. Same maths as
+    the Qwen3 decoder layer (pre-norm, q/k norm, RoPE, GQA); each layer is checkpointed when training.
+    every=True: the normed hidden state at every suffix position, [M, Ls, dim] (padding rows included)."""
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import checkpoint
+    from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
+    mm = model.model
+    dev, dim = pre[0].device, pre[0].shape[-1]
+    G, M = len(pre), len(suf)
+    lp = torch.tensor([x.shape[0] for x in pre], device=dev)
+    ls = torch.tensor([x.shape[0] for x in suf], device=dev)
+    Lp, Ls = int(lp.max()), int(ls.max())
+    g = torch.tensor(grp, device=dev)
+    hp, hs = pre[0].new_zeros(G, Lp, dim), suf[0].new_zeros(M, Ls, dim)
+    for i, x in enumerate(pre):
+        hp[i, :x.shape[0]] = x
+    for i, x in enumerate(suf):
+        hs[i, :x.shape[0]] = x
+    ar_p, ar_s = torch.arange(Lp, device=dev), torch.arange(Ls, device=dev)
+    pos = torch.cat([ar_p.expand(G, -1).reshape(-1), (lp[g][:, None] + ar_s[None]).reshape(-1)])[None]
+    cos, sin = (x[0] for x in mm.rotary_emb(hp, pos))  # [T, head_dim]
+    valid = ar_p[None] < lp[:, None]  # [G, Lp] real prefix keys
+    mask_p = (torch.tril(torch.ones(Lp, Lp, dtype=torch.bool, device=dev))[None] & valid[:, None, :])[:, None]
+    mask_s = torch.cat([valid[g][:, None, :].expand(M, Ls, Lp), torch.tril(torch.ones(Ls, Ls, dtype=torch.bool, device=dev))[None].expand(M, -1, -1)], -1)[:, None]
+    n_p = G * Lp
+    h = torch.cat([hp.reshape(-1, dim), hs.reshape(-1, dim)])
+
+    def layer_fn(layer, h):
+        a = layer.self_attn
+        hd = a.head_dim
+        x = layer.input_layernorm(h)
+        q = a.q_norm(a.q_proj(x).view(h.shape[0], -1, hd))
+        k = a.k_norm(a.k_proj(x).view(h.shape[0], -1, hd))
+        v = a.v_proj(x).view(h.shape[0], -1, hd)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+        heads = lambda t, n, L: t.view(n, L, t.shape[1], hd).transpose(1, 2)  # noqa: E731
+        qp, kp, vp = (heads(t[:n_p], G, Lp) for t in (q, k, v))
+        qs, ks, vs = (heads(t[n_p:], M, Ls) for t in (q, k, v))
+        op = F.scaled_dot_product_attention(qp, kp, vp, attn_mask=mask_p, scale=a.scaling, enable_gqa=True)
+        os_ = F.scaled_dot_product_attention(qs, torch.cat([kp[g], ks], 2), torch.cat([vp[g], vs], 2), attn_mask=mask_s, scale=a.scaling, enable_gqa=True)
+        o = torch.cat([op.transpose(1, 2).reshape(n_p, -1), os_.transpose(1, 2).reshape(M * Ls, -1)])
+        h = h + a.o_proj(o)
+        return h + layer.mlp(layer.post_attention_layernorm(h))
+
+    ckpt = model.training and torch.is_grad_enabled()
+    for layer in mm.layers:
+        h = checkpoint(layer_fn, layer, h, use_reentrant=False) if ckpt else layer_fn(layer, h)
+    if every:
+        return mm.norm(h[n_p:].view(M, Ls, dim))
+    last = h[n_p:].view(M, Ls, dim)[torch.arange(M, device=dev), ls - 1]
+    return mm.norm(last)
+
+
 def load_stack(lora):
     import torch
     import poc_agentmem as A
@@ -125,19 +203,55 @@ def cmd_rate(args):
     model, tok = st.r.model, st.r.tok
     first = lambda ws: sorted({tok.encode(w, add_special_tokens=False)[0] for w in ws})  # noqa: E731
     yes, no = first([" Yes", "Yes", " yes"]), first([" No", "No", " no"])
-    head = model.lm_head.weight[yes + no].float()
+    head = model.lm_head.weight[yes + no].float().to(P.DEV)
+    q8.drop_lm_head(model)  # MPORT_LEAN=1 only: rating reads model.model and these rows
+    if q8.lean():  # the memory core runs on the CPU: a few hundred vectors per batch, and 0.8 GB less on the GPU
+        core = core.cpu()
+    cdev = next(core.parameters()).device
     for wd in args.wordings.split(","):
-        ids = [rating_ids(A, tok, st.r.add_special, PERSONA_PROMPT, WORD[wd].format(q=q), 16) for q, _ in jobs]
-        order = sorted(range(len(jobs)), key=lambda i: len(ids[i]))
+        if args.shared:
+            sp = {q: prompt_ids(A, tok, st.r.add_special, st.r.memory_id, PERSONA_PROMPT, WORD[wd].format(q=q), args.layout) for q in dict.fromkeys(q for q, _ in jobs)}
+        else:
+            assert args.layout == "sys", "--layout qfirst needs --shared 1"
+            ids = [rating_ids(A, tok, st.r.add_special, PERSONA_PROMPT, WORD[wd].format(q=q), 16) for q, _ in jobs]
+            order = sorted(range(len(jobs)), key=lambda i: len(ids[i]))
         for rater in args.raters.split(","):
             set_lora(st, RATERS[rater])
             sc, t0 = [0.0] * len(jobs), time.perf_counter()
-            for b in range(0, len(order), args.batch):
+            if args.shared:
+                byq = {}
+                for i, (q, _) in enumerate(jobs):
+                    byq.setdefault(q, []).append(i)
+                parts = [(q, ix[k:k + args.batch]) for q, ix in byq.items() for k in range(0, len(ix), args.batch)]
+                batches, cur = [], []
+                for part in parts:  # whole requests packed up to --batch facts; bigger ones split
+                    if cur and sum(len(p[1]) for p in cur) + len(part[1]) > args.batch:
+                        batches.append(cur)
+                        cur = []
+                    cur.append(part)
+                batches.append(cur)
+                for bn, chunk in enumerate(batches):
+                    qs = [q for q, _ in chunk]
+                    idx = [i for _, ix in chunk for i in ix]
+                    with torch.no_grad():
+                        d = torch.from_numpy(np.stack([fvec[jobs[i][1]] for i in idx]).astype(np.float32))[:, None].to(cdev)
+                        qv = torch.from_numpy(np.stack([qvec[jobs[i][0]] for i in idx]).astype(np.float32)).to(cdev)
+                        mem = C.core_fwd(core, d, qv).to(P.DEV, dt)
+                        pre = [P.input_embeds(model, tok, st.r.memory_id, torch.tensor([sp[q][0]], device=P.DEV), None)[0] for q in qs]
+                        suf = [P.input_embeds(model, tok, st.r.memory_id, torch.tensor([sp[jobs[i][0]][1]], device=P.DEV), mem[j:j + 1])[0] for j, i in enumerate(idx)]
+                        h = shared_hidden(model, pre, suf, [qs.index(jobs[i][0]) for i in idx])
+                        lg = h.float() @ head.t()
+                        out = torch.logsumexp(lg[:, :len(yes)], -1) - torch.logsumexp(lg[:, len(yes):], -1)
+                    for i, v in zip(idx, out.tolist()):
+                        sc[i] = v
+                    if bn == 0:
+                        print(f"TOK rate first batch: {len(qs)} requests, {len(idx)} facts in {time.perf_counter() - t0:.1f}s (shared prefix, layout {args.layout})", flush=True)
+            for b in range(0, len(order), args.batch) if not args.shared else ():
                 idx = order[b:b + args.batch]
                 with torch.no_grad():
-                    d = torch.from_numpy(np.stack([fvec[jobs[i][1]] for i in idx]).astype(np.float32))[:, None].to(P.DEV)
-                    q = torch.from_numpy(np.stack([qvec[jobs[i][0]] for i in idx]).astype(np.float32)).to(P.DEV)
-                    mem = C.core_fwd(core, d, q).to(dt)  # [n, 16, dim]: each fact alone, conditioned on its request
+                    d = torch.from_numpy(np.stack([fvec[jobs[i][1]] for i in idx]).astype(np.float32))[:, None].to(cdev)
+                    q = torch.from_numpy(np.stack([qvec[jobs[i][0]] for i in idx]).astype(np.float32)).to(cdev)
+                    mem = C.core_fwd(core, d, q).to(P.DEV, dt)  # [n, 16, dim]: each fact alone, conditioned on its request
                     embs = [P.input_embeds(model, tok, st.r.memory_id, torch.tensor([ids[i]], device=P.DEV), mem[j:j + 1])[0] for j, i in enumerate(idx)]
                     t = max(x.shape[0] for x in embs)
                     x = embs[0].new_zeros(len(embs), t, embs[0].shape[1])
@@ -212,6 +326,9 @@ def cmd_answer(args):
     print(f"TOK answer: {len(ev)} questions, reader {args.lora}, conditions: " + "; ".join(c[0] for c in conds), flush=True)
     todo = build_rows(ev, pmap, full, conds)
     torch, A, C, st, core, dt = load_stack(args.lora)
+    if q8.lean():  # 4-bit lean box run: core on the CPU, the whole output layer on the GPU for generation
+        core = core.cpu()
+        q8.head_to_gpu(st.r.model)
     ans, t0 = [], time.perf_counter()
     for b in range(0, len(todo), args.batch):
         items = []
@@ -291,6 +408,8 @@ def main():
     r.add_argument("--raters", default="tok,tokL")
     r.add_argument("--batch", type=int, default=96)
     r.add_argument("--tag", default="", help="suffix after the rater name in the table name, e.g. 90 -> tokL90_change")
+    r.add_argument("--layout", default="sys", choices=["sys", "qfirst"], help="memory in the system prompt (original) or after the request")
+    r.add_argument("--shared", type=int, default=1, help="1: compute each request's prefix once for all its facts (shared_hidden)")
     a = sub.add_parser("answer")
     a.add_argument("--tables", default="tok_change")
     a.add_argument("--no-controls", action="store_true")

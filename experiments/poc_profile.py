@@ -181,10 +181,11 @@ def cmd_embed(args):
 
 def blocks(C, core, vecs, qv, k, P, torch):
     """Each fact through the untouched core on its own; keep the first k of its 16 slots. -> [1, n * k, dim]"""
-    d = torch.from_numpy(np.asarray(vecs, dtype=np.float32))[:, None].to(P.DEV)
-    q = torch.from_numpy(qv.astype(np.float32))[None].expand(d.size(0), -1).to(P.DEV)
+    cdev = next(core.parameters()).device  # the CPU under MPORT_LEAN=1
+    d = torch.from_numpy(np.asarray(vecs, dtype=np.float32))[:, None].to(cdev)
+    q = torch.from_numpy(qv.astype(np.float32))[None].expand(d.size(0), -1).to(cdev)
     out = C.core_fwd(core, d, q)
-    return out[:, :k].reshape(1, -1, out.size(-1))
+    return out[:, :k].reshape(1, -1, out.size(-1)).to(P.DEV)
 
 
 def cmd_train(args):

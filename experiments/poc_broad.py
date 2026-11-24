@@ -450,6 +450,8 @@ def attn_memory(C, core, vecs, qv, score, beta, P, torch):
 
 def cmd_train(args):
     import torch
+    import fast_train as FT
+    import q8
     import poc_agentmem as A
     import poc_core as C
     import poc_fast as FB
@@ -498,6 +500,12 @@ def cmd_train(args):
     st = A.Stack("lora", train=True)
     C.load_lora(st, args.init)
     core = st.core.float().eval()
+    loss_fn = FB.loss_batch
+    if q8.lean():  # 4-bit lean box run: core on the CPU, output layer on the GPU, packed forward + chunked loss
+        core = core.cpu()
+        q8.head_to_gpu(st.r.model)
+        FT.fast_lora(st.lora)  # branch in fp16, no dropout
+        loss_fn = FB.lean_loss_batch
     lps = [t for mod in st.lora for t in (mod.A, mod.B)]
     groups = [{"params": lps, "lr": args.lr, "base": args.lr}]
     delta = None
@@ -551,15 +559,15 @@ def cmd_train(args):
         frac = min(1.0, (time.perf_counter() - t0) / budget)
         for g in opt.param_groups:
             g["lr"] = g["base"] * min(1.0, (u + 1) / 20) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * frac)))
-        loss = FB.loss_batch(st, [item() for _ in range(args.batch)])
+        loss = loss_fn(st, [item() for _ in range(args.batch)])
         loss.backward()
         run.append(loss.item())
         torch.nn.utils.clip_grad_norm_(lps, 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
         u += 1
-        if u % 50 == 0:
-            print(f"update {u}  examples {u * args.batch}  loss {np.mean(run[-50:]):.3f}  {(time.perf_counter() - t0) / 60:.1f} min", flush=True)
+        if u % 50 == 0 or u in (1, 5):
+            print(f"update {u}  examples {u * args.batch}  loss {np.mean(run[-50:]):.3f}  {(time.perf_counter() - t0) / 60:.1f} min  peak {torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0:.2f} GiB", flush=True)
     torch.save(st.state(), OUT / f"lora_{args.tag}.pt")
     if delta is not None:
         torch.save({"rank": args.delta, "state": {k: v.cpu() for k, v in delta.state_dict().items()}}, OUT / f"lora_{args.tag}.delta.pt")

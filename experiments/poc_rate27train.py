@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--prompt", default="wrong", choices=sorted(PROMPTS))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="rater_train27.json")
+    ap.add_argument("--exclude", default="", help="comma-separated earlier outputs: their requests are not drawn again")
     args = ap.parse_args()
     from transformers import AutoTokenizer
     K = PF.poc()
@@ -38,12 +39,14 @@ def main():
     by = {}
     for r in json.loads((K.OUT / "rater_train.json").read_text()):
         by.setdefault(r["q"], []).append(r)
-    reqs = random.Random(args.seed).sample(sorted(by), min(args.requests, len(by)))
+    done = {r["q"] for f in filter(None, args.exclude.split(",")) for r in json.loads((K.OUT / f).read_text())}
+    pool = sorted(q for q in by if q not in done)
+    reqs = random.Random(args.seed).sample(pool, min(args.requests, len(pool)))
     jobs = [r for q in reqs for r in by[q]]
     tx = W.Text(AutoTokenizer.from_pretrained(os.environ.get("MPORT_RATER_TOK", K.DECODER)))
     pr = PROMPTS[args.prompt]
     assert "{f}" not in pr, "fact-last wordings are not supported here"
-    print(f"RATE27 {len(reqs)} requests, {len(jobs)} pairs, prompt {args.prompt}", flush=True)
+    print(f"RATE27 {len(reqs)} requests ({len(done)} excluded), {len(jobs)} pairs, prompt {args.prompt}", flush=True)
     sc = W.yes_score(tx, [tx.msgs([r["f"]], pr.format(q=r["q"])) for r in jobs])
     out = [{"q": r["q"], "f": r["f"], "s": round(s, 3), "known": r["known"], "s8": r["s"]} for r, s in zip(jobs, sc)]
     (K.OUT / args.out).write_text(json.dumps(out))

@@ -997,6 +997,96 @@ Answers from the picked blocks (the column header shows how many facts the reade
 - **Result (stopped by the user at step 19 of about 50, before the answer test).** Training reward, clue shown: 0.28 over steps 1–10 and 0.29 over steps 11–19. Clue not shown: 0.89 / 0.87. Only 3.1–3.2 of the 8 groups per step had any spread, so there was any gradient at all. Single steps range from 0.06 to 0.75.
 - **Inconclusive, no sign of learning in 19 steps.** The signal is sparse (most groups: all 4 samples ignore the clue) and each step has only 8 contexts. A real run needs more samples per context, a denser reward and hundreds of steps: a V100 job, not a Mac one. See [REPORT_2026-11-24_token_path.md](REPORT_2026-11-24_token_path.md) for the proposed v2.
 
+### 45. The block rater on a 4-bit base (QLoRA-style), on 8 GB-class GPU memory (V100 box, 2026-11-24)
+
+[q8.py](q8.py) (`MPORT_QBITS=4`), [run_box_q4.sh](run_box_q4.sh); logs `v100_q4_rate90q8`, `v100_q4_train`, `v100_q4_rateq4` on the box; checkpoint `lora_tokrater_q4.pt`.
+
+- **Question.** Does the token-path rater still work when the frozen Qwen3-8B is stored in 4 bits, so that someone with a small GPU can train and run it?
+- **Setup.**
+  - Weights are 4-bit, asymmetric, in groups of 64, and are dequantized for each matmul. Backward dequantizes again instead of keeping the weights.
+  - The LoRA and the memory core stay at full precision.
+  - The embedding table and the output layer stay in CPU memory (`MPORT_LEAN=1`). The raters copy only the Yes/No rows to the GPU.
+  - The layers are split over two V100s (`MPORT_SPLIT=1`), each capped at 4 GB beside production and another job. fp16, because V100 has no bf16.
+- **Memory.** Training peaks at 3.53 GiB on GPU 0 and 2.81 GiB on GPU 1, about 6.3 GiB in total. Rating at batch 24 fits; batch 96 ran out of memory.
+- **Speed.** Training: 218 steps (436 requests) in 25.6 min, about 7 s per step. Rating: 2,841 pairs in 5–6 min.
+- **Results (wording `change`, stride 3, same eval as test 43).**
+
+| Rater | from 8: first / top 2 | from 16: first / top 4 | from 48: first / top 4 / top 8 | val spearman, top in top 3 |
+|---|---|---|---|---|
+| int8-trained, run on int8 (`tokL90q8`, test 43) | 0.47 / 0.60 | – | 0.09 / 0.42 / 0.55 | 0.674 / 0.83 |
+| int8-trained, run on 4-bit (`tokL90q8b4`) | 0.47 / 0.60 | 0.30 / 0.58 | 0.10 / 0.48 / 0.53 | – |
+| trained and run on 4-bit (`tokLq4`) | 0.51 / 0.68 | 0.33 / 0.67 | 0.23 / 0.43 / 0.58 | 0.693 / 0.80 |
+
+- **Reading.**
+  - Going down to 4 bits costs nothing here. An int8-trained LoRA moves to a 4-bit base unchanged.
+  - A LoRA trained on the 4-bit base is as good or slightly better. Clue first of 48 goes from 0.09 to 0.23, but this is one run on 106 eval requests, and top 4 of 48 is slightly lower. Treat it as a tie, not a gain.
+  - The 4-bit rater says Yes to 0.10 of pairs, against 0.51 for the int8 one. Only the ranking is used, so calibration does not matter here.
+- **Not tested.** The reader (generation) on 4-bit. On the Mac, 4-bit greedy text was repetitive (mean KL 0.09–0.16 against int8), so check reader answers before trusting it there.
+
+### 46. A faster, smaller 4-bit training pipeline for the block rater (V100 box, 2026-11-24)
+
+[q8.py](q8.py), [q4_bench.py](q4_bench.py), `shared_hidden` in [poc_tok.py](poc_tok.py), flags in [poc_tokrater.py](poc_tokrater.py); logs `v100_q4bench`, `v100_tm_sys`, `v100_sh_*`.
+
+- **Measured first (q4_bench.py).** One layer's products on a V100 shared with another job at 100%, extrapolated to a step of 20 prompts:
+  - fp16 matmuls: 3.2 s
+  - plain-torch 4-bit unpacking: 2.2 s (five kernels per weight, three times per step)
+  - streaming from CPU: 1.2 s more
+- **Changes.**
+  1. **Fused unpack kernel (Triton).** One pass reads 4.5 bits per weight and writes fp16. It matches plain torch (max abs difference 3e-5) and takes 0.38 s per step instead of 2.2 s. It is on by default on CUDA; `MPORT_Q4_TRITON=0` turns it off. `torch.compile` crashed inside dynamo on torch 2.14, so it is hand-written.
+  2. **Offload (`MPORT_OFFLOAD=1`).** The packed layers stay in pinned CPU memory. `LayerPrefetch` copies layer L±1 on a side CUDA stream while layer L computes, keeping at most 4 layers on the GPU. This works in both directions, so the backward pass (recompute, then reverse) is covered too.
+  3. **CPU-side parts.** The memory core runs on the CPU in lean mode (no gradient, a few vectors per step), which frees 0.8 GB. The output layer stays on the CPU, and only its Yes/No rows go to the GPU.
+  4. **Shared-prefix forward (`shared_hidden`, `--shared 1`, default).**
+     - The decoder layers are written by hand: pre-norm, q/k norm, RoPE, GQA, sdpa.
+     - All tokens stay in one flat matrix, so each weight is unpacked once per pass.
+     - Each request's prompt prefix is computed once, and every fact attends to its keys and values.
+     - It matches the HF forward within 0.025 log-odds (fp16).
+- **Result.**
+  - 1.4 GiB peak on one GPU, against 3.5 + 2.8 GiB on two GPUs in test 45.
+  - 4.1 s per step against 7.0 s.
+  - The step is now matmul-bound (forward 1.6 s, backward 2.5 s; `MPORT_TIMING=1` prints this).
+  - With the original layout only about 25 of 141 prompt tokens are shared, so the shared prefix saves little there.
+- **Tried and rejected (8B labels, 218 steps, same eval as test 45):**
+
+| 4-bit rater | from 8: first / top 2 | from 48: first / top 4 / top 8 | val spearman | step |
+|---|---|---|---|---|
+| all layers, original layout (test 45) | 0.51 / 0.68 | 0.23 / 0.43 / 0.58 | 0.693 | 4.1 s |
+| request before the memory block (`--layout qfirst`): about 3.5x fewer tokens | 0.28 / 0.46 | 0.05 / 0.23 / 0.40 | 0.480 | 3.5 s |
+| LoRA on layers 18-35 only (`--lora-from 18`) | 0.45 / 0.62 | 0.15 / 0.44 / 0.53 | 0.619 | not comparable (other GPU) |
+
+  - The frozen decoder reads memory tokens well only where it was trained to see them, in the system prompt. Question-first would make rating 48 facts about 5x cheaper at serving time, but it would need far more training.
+- **Not done.** A W4A16 GEMM with unpacking inside the matmul (about 0.4 s per step left), and CUDA graphs.
+
+### 47. Check 4c: the block rater taught by the 27B (V100 box, 2026-11-24)
+
+[poc_rate27train.py](poc_rate27train.py) (labels), [poc_tokrater.py](poc_tokrater.py) `--data rater_train27.json`, [run_box_ab.sh](run_box_ab.sh); logs `v100_r27train`, `v100_ab_r27_*`, `v100_ab_q4long_*`.
+
+- **Labels.**
+  - The 27B scored 1,000 training-type requests: all 25,096 of their (request, fact) pairs, wording "wrong".
+  - Source: production's own vLLM server (same checkpoint as test 41), through the OpenAI API.
+  - It sent 16 prompts at a time and waited whenever production had queued requests (`MPORT_VLLM_CHUNK`, `MPORT_VLLM_POLITE`).
+  - Took 2.4 h. Correlation with the 8B's labels 0.68. Held-out types are never rated.
+- **Student.**
+  - 4-bit, offloaded, one GPU (test 46): 485 steps (one pass over the 970 training requests), 41 min, peak 1.47 GiB.
+  - Val spearman against the 27B: 0.689.
+- **Control: is the old student capped by its teacher?** 650 steps on the 8B labels raised val spearman to 0.757, but the eval did not improve: from 48, first 0.11, top 4 0.44, top 8 0.53. Yes, it is capped.
+
+| Rater (wording change, stride 3) | from 8: first / top 2 / top 4 | from 16: first / top 4 / top 8 | from 48: first / top 4 / top 8 |
+|---|---|---|---|
+| block rater, 8B labels, 218 steps (test 45) | 0.51 / 0.68 / 0.82 | 0.33 / 0.67 / 0.88 | 0.23 / 0.43 / 0.58 |
+| block rater, 8B labels, 650 steps | 0.46 / 0.64 / 0.80 | 0.30 / 0.62 / 0.82 | 0.11 / 0.44 / 0.53 |
+| block rater, 27B labels, 485 steps from scratch (`r27`) | 0.54 / 0.75 / 0.86 | 0.39 / 0.74 / 0.90 | 0.25 / 0.51 / 0.67 |
+| **same, warm start from test 45's LoRA (`r27w`)** | **0.61 / 0.75 / 0.88** | **0.44 / 0.78 / 0.91** | **0.29 / 0.50 / 0.70** |
+| 8B text rater (old teacher) | 0.55 / 0.75 / 0.85 | 0.29 / 0.74 / 0.85 | 0.16 / 0.46 / 0.72 |
+| 27B text rater (new teacher, test 41) | 0.72 / 0.84 / 0.99 | 0.56 / 0.91 / 0.99 | 0.35 / 0.72 / 0.82 |
+
+- **Reading.**
+  - The better teacher helps on every row. Top 4 of 48 rises from 0.43 to 0.51, and top 2 of 8 from 0.68 to 0.75. Toddler (top 2 of 8) goes from 0.38 to 0.54.
+  - Starting from the 8B-taught LoRA (`--init lora_tokrater_q4.pt`) helps the first place most: 0.61 / 0.44 / 0.29 at 8 / 16 / 48 facts, val spearman 0.716 (from scratch 0.689). Checkpoint `lora_tokrater_r27w.pt`.
+  - The 16-token rater now matches or beats the 8B reading the facts as text, except top 8 of 48.
+  - It is still well below its 27B teacher, so the student is no longer the only limit. That leaves room to grow: more labelled requests, or more passes.
+  - One run, 106 eval requests.
+- **Next (running 2026-11-25).** 2,000 more requests (50,213 pairs) for the 27B to label, none overlapping the first 1,000 (`--exclude`). The reader is tested on `r27w`'s picks: the current reader, and one trained with the clue at a random place among 1-4 blocks ([run_box_reader.sh](run_box_reader.sh); 4-bit training via `poc_fast.lean_loss_batch`, checked against the plain loss in [reader_check.py](reader_check.py)).
+
 ## Caveats
 
 - One seed everywhere; n = 60 sessions (one session = 1.7 points) or 290 names.

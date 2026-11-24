@@ -128,7 +128,7 @@ def load_decoder(model_id: str):
     # MPORT_DTYPE=float16 on GPUs without fast bfloat16 (V100)
     if os.environ.get("MPORT_Q8") == "1":  # Mac light mode: int8 weight-only decoder layers (experiments/q8.py)
         import q8
-        model = q8.load(model_id, DEV)
+        model = q8.make_lean(q8.load(model_id, DEV))
     else:
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=getattr(torch, os.environ.get("MPORT_DTYPE", "bfloat16")), attn_implementation="sdpa",
                                                      device_map=str(DEV), low_cpu_mem_usage=True)

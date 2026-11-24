@@ -54,6 +54,36 @@ def loss_batch(st, items):
     return (ce.sum(1) / (tgt != -100).sum(1).clamp(min=1)).mean()
 
 
+def lean_loss_batch(st, items, chunk=256):
+    """loss_batch for 4-bit lean training (q8, MPORT_LEAN=1): a packed forward (poc_tok.shared_hidden, right
+    padding, every layer checkpointed) and the output layer only at answer positions, in checkpointed chunks, so the
+    full-vocabulary logits of the whole batch never exist at once. Same weighting as loss_batch. Needs the output
+    layer on the GPU (q8.head_to_gpu)."""
+    import torch
+    from torch.utils.checkpoint import checkpoint
+    from poc_agentmem import P
+    import poc_tok as T
+    pre, suf, tgt = [], [], []
+    for question, mem, answer in items:
+        ids, labels = st.ids(question, mem.shape[1], answer)
+        e = P.input_embeds(st.r.model, st.r.tok, st.r.memory_id, ids, mem)[0]
+        lab = labels[0].to(e.device)
+        a = int((lab != -100).nonzero()[0])  # first answer token; the position before it predicts it
+        pre.append(e[:a - 1])
+        suf.append(e[a - 1:-1])  # suffix position j predicts token a + j
+        tgt.append(lab[a:])
+    h = T.shared_hidden(st.r.model, pre, suf, list(range(len(items))), every=True)
+    H = torch.cat([h[i, :len(x)] for i, x in enumerate(tgt)])
+    Y = torch.cat(tgt)
+    w = torch.cat([torch.full((len(x),), 1.0 / max(int((x != -100).sum()), 1) / len(tgt), device=H.device) for x in tgt])
+    head = st.r.model.lm_head
+
+    def ce(hc, yc, wc):
+        return (torch.nn.functional.cross_entropy(head(hc).float(), yc, ignore_index=-100, reduction="none") * wc).sum()
+
+    return sum(checkpoint(ce, H[i:i + chunk], Y[i:i + chunk], w[i:i + chunk], use_reentrant=False) for i in range(0, len(Y), chunk))
+
+
 def generate_batch(st, items, max_new):
     import torch
     x, mask, _ = pad_batch(st, [(q, m, None) for q, m in items])

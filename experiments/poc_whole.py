@@ -186,10 +186,17 @@ def yes_score(tx, msgs):
     """log P(Yes) - log P(No) for the first reply token, from the vLLM server at MPORT_VLLM_URL (H35b)."""
     import os
     import urllib.request
+    import time
     texts = [tx.apply(tx.tok, m, add_generation_prompt=True) for m in msgs]
     out = []
-    for b in range(0, len(texts), 2000):
-        body = json.dumps({"model": os.environ.get("MPORT_VLLM_MODEL", "qwen3-8b"), "prompt": texts[b:b + 2000], "max_tokens": 1, "temperature": 0, "logprobs": 20}).encode()
+    n = int(os.environ.get("MPORT_VLLM_CHUNK", "2000"))  # small chunks + MPORT_VLLM_POLITE=1 on a shared (production) server
+    t0 = time.perf_counter()
+    for b in range(0, len(texts), n):
+        while os.environ.get("MPORT_VLLM_POLITE") == "1" and _waiting(os.environ["MPORT_VLLM_URL"]) > 0:
+            time.sleep(2)  # someone else is queued: let them go first
+        if b and b // n % 100 == 0:
+            print(f"yes_score {b}/{len(texts)} (+{time.perf_counter() - t0:.0f}s)", flush=True)
+        body = json.dumps({"model": os.environ.get("MPORT_VLLM_MODEL", "qwen3-8b"), "prompt": texts[b:b + n], "max_tokens": 1, "temperature": 0, "logprobs": 20}).encode()
         req = urllib.request.Request(os.environ["MPORT_VLLM_URL"] + "/v1/completions", body, {"Content-Type": "application/json"})
         res = sorted(json.loads(urllib.request.urlopen(req, timeout=3600).read())["choices"], key=lambda c: c["index"])
         for c in res:
@@ -197,6 +204,16 @@ def yes_score(tx, msgs):
             get = lambda w: max([v for k, v in top.items() if k.strip().lower() == w] or [-30.0])  # noqa: E731
             out.append(get("yes") - get("no"))
     return out
+
+
+def _waiting(url):
+    """Requests waiting in a vLLM server's queue (its /metrics), 0 if unknown."""
+    import urllib.request
+    try:
+        m = urllib.request.urlopen(url + "/metrics", timeout=5).read().decode()
+    except OSError:
+        return 0
+    return sum(float(x.split()[-1]) for x in m.splitlines() if x.startswith("vllm:num_requests_waiting{"))
 
 
 def row_key(q, clue, facts):

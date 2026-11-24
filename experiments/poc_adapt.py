@@ -62,8 +62,8 @@ class LoRALinear(torch.nn.Module):
     def __init__(self, base: torch.nn.Linear, r=8, alpha=16, dropout=0.05):
         super().__init__()
         self.base = base
-        self.A = torch.nn.Parameter(torch.randn(r, base.in_features, device=base.weight.device) / math.sqrt(base.in_features))
-        self.B = torch.nn.Parameter(torch.zeros(base.out_features, r, device=base.weight.device))
+        self.A = torch.nn.Parameter(torch.randn(r, base.in_features, device=getattr(base, "dev", base.weight.device)) / math.sqrt(base.in_features))
+        self.B = torch.nn.Parameter(torch.zeros(base.out_features, r, device=getattr(base, "dev", base.weight.device)))
         self.scale = alpha / r
         self.drop = torch.nn.Dropout(dropout)
 
