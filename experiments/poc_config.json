@@ -1,0 +1,259 @@
+{
+  "description": "Hand-written synthetic buried-clue set for POC_PLAN.md step 0. Rubrics use the memorilla-demos rule: every all_of group needs one case-insensitive substring hit, no none_of phrase may appear. 'mentions' = the constraint is referenced; 'acts' = the answer accommodates it. 'conflict' = regex (case-insensitive) that drops a Sam filler chat from users of that type. 'acts_q' overrides acts for one question index.",
+  "test_types": ["health", "no_car", "toddler", "flying"],
+  "types": {
+    "diet": {
+      "questions": ["What should I cook for my parents this Sunday?",
+                    "What snacks should I bring to a friend's movie night?",
+                    "Plan my dinners for next week."],
+      "conflict": "vegan|vegetarian|allerg|halal|dairy|lactose|\\bnuts?\\b",
+      "values": {
+        "vegan": {"fact": "they have been vegan for several years",
+          "mentions": {"all_of": [["vegan", "plant-based", "plant based"]]},
+          "acts": {"all_of": [["vegan", "plant-based", "plant based"]],
+                   "none_of": ["chicken", "beef", "pork", "salmon", "steak", "lamb", "bacon", "shrimp", "turkey"]}},
+        "nut_allergy": {"fact": "they have a severe nut allergy",
+          "mentions": {"all_of": [["nut allergy", "nut-free", "nut free", "allergy", "allergic", "tree nut", "peanut"]]},
+          "acts": {"all_of": [["nut allergy", "nut-free", "nut free", "allergy", "allergic", "without nuts", "no nuts"]],
+                   "none_of": ["almond", "walnut", "pecan", "cashew", "pistachio", "hazelnut", "peanut butter", "pesto", "trail mix"]}},
+        "halal": {"fact": "they only eat halal food",
+          "mentions": {"all_of": [["halal"]]},
+          "acts": {"all_of": [["halal"]],
+                   "none_of": ["bacon", "prosciutto", "pork chop", "pork belly", "pulled pork", "pork loin", "pork tenderloin", "glass of wine", "wine pairing", "red wine", "white wine"]}},
+        "lactose": {"fact": "they are lactose intolerant",
+          "mentions": {"all_of": [["lactose", "dairy"]]},
+          "acts": {"all_of": [["lactose", "dairy-free", "dairy free", "non-dairy", "no dairy", "without dairy", "oat milk", "plant milk"]],
+                   "none_of": ["cheese sauce", "cream sauce", "mac and cheese", "alfredo", "heavy cream", "cheesecake"]}}
+      }
+    },
+    "pet": {
+      "questions": ["Plan me a weekend getaway.",
+                    "Help me plan a two-week trip abroad this summer.",
+                    "What's a fun way to spend a whole Saturday out?"],
+      "conflict": "\\bdogs?\\b|\\bcats?\\b|\\bpets?\\b|\\bpupp",
+      "values": {
+        "dog_carsick": {"fact": "their dog gets badly carsick on any drive longer than about 20 minutes",
+          "mentions": {"all_of": [["dog", "pup", "pet"], ["carsick", "car sick", "car-sick", "motion sick", "motion-sick", "car ride", "nause", "car travel", "in the car"]]},
+          "acts": {"all_of": [["dog", "pup", "pet"], ["train", "sitter", "boarding", "kennel", "carsick", "car sick", "car-sick", "motion sick", "short drive", "long drive", "close to home", "nearby", "walkable", "20 minutes"]]}},
+        "cat_meds": {"fact": "their cat needs medication twice a day, morning and evening",
+          "mentions": {"all_of": [["cat", "kitty"], ["medication", "meds", "medicine", "pill", "dose", "twice a day", "twice-daily"]]},
+          "acts": {"all_of": [["cat", "kitty"], ["sitter", "boarding", "neighbor", "neighbour", "someone to", "medication", "meds", "pill", "dose", "back home", "home by", "back in time"]]}},
+        "dog_reactive": {"fact": "their dog is reactive and lunges at other dogs",
+          "mentions": {"all_of": [["dog", "pup"], ["reactive", "other dogs", "lunge", "aggressive", "anxious around"]]},
+          "acts": {"all_of": [["dog", "pup"], ["reactive", "other dogs", "quiet", "less crowded", "off-peak", "sitter", "boarding", "secluded", "away from", "on leash", "on a leash"]]}}
+      }
+    },
+    "schedule": {
+      "questions": ["When's the best time for me to go to the gym?",
+                    "Help me make a weekly schedule for learning guitar.",
+                    "When should I plan to catch up with friends this month?"],
+      "conflict": "\\bshift|nurse|night work|work(ing)? (on )?weekends|3 a\\.m",
+      "values": {
+        "bakery_3am": {"fact": "their bakery shift starts at 3 a.m. every weekday",
+          "mentions": {"all_of": [["3 a.m", "3 am", "3am", "3:00 a", "bakery", "early shift", "early-morning shift", "early morning shift", "shift"]]},
+          "acts": {"all_of": [["3 a.m", "3 am", "3am", "3:00 a", "bakery", "early shift", "shift"],
+                              ["late morning", "midday", "mid-day", "noon", "afternoon", "after your shift", "after work", "10 a.m", "10 am", "11 a.m", "11 am", "1 p.m", "1 pm", "2 p.m", "2 pm", "weekend"]]}},
+        "night_nurse": {"fact": "they work night shifts as a nurse",
+          "mentions": {"all_of": [["night shift", "night-shift", "overnight", "nights", "nurse", "nursing"]]},
+          "acts": {"all_of": [["night shift", "night-shift", "overnight", "nights", "nurse", "shift"],
+                              ["afternoon", "before your shift", "after you wake", "after waking", "days off", "day off", "evening", "after sleep", "after you sleep", "wake up"]]}},
+        "weekends": {"fact": "they work every Saturday and Sunday",
+          "mentions": {"all_of": [["work weekends", "working weekends", "work on weekends", "weekend shift", "work saturday", "work sunday", "work every saturday", "saturdays and sundays", "weekend job", "on weekends", "weekends"]]},
+          "acts": {"all_of": [["work weekends", "working weekends", "weekend shift", "weekend job", "saturdays and sundays", "weekends", "since you work"],
+                              ["weekday", "monday", "tuesday", "wednesday", "thursday", "friday", "midweek", "days off", "day off"]]}}
+      }
+    },
+    "mobility": {
+      "questions": ["Plan me a day of sightseeing in Rome.",
+                    "What's a good date idea for this weekend?",
+                    "Suggest a fun group activity for my birthday."],
+      "conflict": "knee|wheelchair|injur|crutch",
+      "values": {
+        "knee": {"fact": "they have a knee injury and can't do stairs or long walks right now",
+          "mentions": {"all_of": [["knee"]]},
+          "acts": {"all_of": [["knee", "injury"], ["stairs", "walking", "walk", "low-impact", "low impact", "seated", "elevator", "taxi", "rest", "accessible", "easy on", "sit"]]}},
+        "wheelchair": {"fact": "they use a wheelchair",
+          "mentions": {"all_of": [["wheelchair"]]},
+          "acts": {"all_of": [["wheelchair", "accessible", "accessibility", "step-free", "step free", "ramp"]],
+                   "none_of": ["hike", "hiking", "climb the", "rock climbing", "kayak"]}}
+      }
+    },
+    "alcohol": {
+      "questions": ["Plan a fun night out for my birthday.",
+                    "What should I bring to a friend's dinner party?",
+                    "Suggest a date idea for Friday night."],
+      "conflict": "\\bwine|\\bbeer|cocktail|alcohol|sober|whisk",
+      "values": {
+        "no_alcohol": {"fact": "they don't drink alcohol",
+          "mentions": {"all_of": [["don't drink", "do not drink", "alcohol-free", "alcohol free", "non-alcoholic", "no alcohol", "without alcohol", "mocktail", "sober", "teetotal"]]},
+          "acts": {"all_of": [["don't drink", "do not drink", "alcohol-free", "alcohol free", "non-alcoholic", "no alcohol", "without alcohol", "mocktail", "sober", "sparkling juice", "kombucha"]],
+                   "none_of": ["bottle of wine", "wine tasting", "winery", "brewery", "pub crawl", "craft beer", "bar hop", "bar-hop", "champagne"]}},
+        "sober": {"fact": "they have been sober for two years",
+          "mentions": {"all_of": [["sober", "sobriety", "alcohol-free", "alcohol free", "non-alcoholic", "no alcohol", "mocktail", "recovery"]]},
+          "acts": {"all_of": [["sober", "sobriety", "alcohol-free", "alcohol free", "non-alcoholic", "no alcohol", "without alcohol", "mocktail", "sparkling juice", "kombucha"]],
+                   "none_of": ["bottle of wine", "wine tasting", "winery", "brewery", "pub crawl", "craft beer", "bar hop", "bar-hop", "champagne"]}}
+      }
+    },
+    "budget": {
+      "questions": ["Plan me a weekend getaway.",
+                    "What should I get my best friend for her birthday?",
+                    "Help me plan a birthday party for myself."],
+      "conflict": "budget|debt|saving|emergency fund|afford|\\bcheap",
+      "values": {
+        "tight_budget": {"fact": "money is really tight for them right now",
+          "mentions": {"all_of": [["budget", "affordable", "cheap", "inexpensive", "low-cost", "low cost", "frugal", "tight", "save money", "saving money", "costs down", "money"]]},
+          "acts": {"all_of": [["budget", "affordable", "cheap", "inexpensive", "low-cost", "low cost", "frugal", "free ", "diy", "homemade", "potluck"]],
+                   "none_of": ["luxury", "five-star", "5-star", "splurge", "michelin", "designer", "spa day", "upscale"]}},
+        "debt": {"fact": "they are paying off a lot of debt and cutting their spending",
+          "mentions": {"all_of": [["debt", "budget", "spending", "affordable", "cheap", "inexpensive", "low-cost", "frugal", "save money"]]},
+          "acts": {"all_of": [["budget", "affordable", "cheap", "inexpensive", "low-cost", "low cost", "frugal", "free ", "diy", "homemade", "potluck", "debt"]],
+                   "none_of": ["luxury", "five-star", "5-star", "splurge", "michelin", "designer", "spa day", "upscale"]}}
+      }
+    },
+    "studio": {
+      "questions": ["What should I cook for my parents this Sunday?",
+                    "Help me plan a dinner party for six.",
+                    "Give me a recipe idea for tonight."],
+      "conflict": "\\boven\\b|\\bbak(e|ing)\\b|stove|microwave|studio|dorm",
+      "values": {
+        "no_oven": {"fact": "they live in a tiny studio with no oven",
+          "mentions": {"all_of": [["no oven", "without an oven", "don't have an oven", "oven-free", "studio", "no-bake", "stovetop", "stove-top", "small kitchen", "tiny kitchen", "hot plate"]]},
+          "acts": {"all_of": [["no oven", "without an oven", "no-bake", "no bake", "stovetop", "stove-top", "one-pan", "one pan", "skillet", "no-cook", "hot plate", "slow cooker", "air fryer", "takeout", "small space", "studio"]],
+                   "none_of": ["bake at", "preheat", "oven to", "in the oven", "casserole", "lasagna", "roast chicken", "sheet pan"]}},
+        "microwave": {"fact": "their dorm room only has a microwave, no stove or oven",
+          "mentions": {"all_of": [["microwave", "dorm"]]},
+          "acts": {"all_of": [["microwave", "no-cook", "no cook", "no stove", "no oven", "dorm", "takeout"]],
+                   "none_of": ["preheat", "in the oven", "bake at", "sauté", "saute", "skillet", "grill", "stovetop", "frying pan"]}}
+      }
+    },
+    "hay_fever": {
+      "questions": ["Plan a picnic date for this weekend.",
+                    "Suggest a fun outdoor activity for a sunny spring day.",
+                    "I want to start a small garden - where should I begin?"],
+      "conflict": "pollen|allerg|hay fever|\\bstings?\\b|\\bbees?\\b|epipen",
+      "values": {
+        "hay_fever": {"fact": "they have severe hay fever",
+          "mentions": {"all_of": [["hay fever", "hayfever", "pollen", "allerg", "antihistamine"]]},
+          "acts": {"all_of": [["hay fever", "hayfever", "pollen", "allerg", "antihistamine"],
+                              ["pollen count", "pollen forecast", "antihistamine", "indoor", "after rain", "evening", "low-pollen", "low pollen", "mask", "sunglasses", "medication", "check the pollen", "allergy-friendly"]]}},
+        "bee_sting": {"fact": "they are allergic to bee stings and carry an EpiPen",
+          "mentions": {"all_of": [["bee sting", "bee allergy", "allergic to bees", "sting", "epipen", "epi-pen", "auto-injector", "wasp", "bees"]]},
+          "acts": {"all_of": [["bee sting", "bee allergy", "sting", "epipen", "epi-pen", "auto-injector", "wasp", "bees"],
+                              ["epipen", "epi-pen", "auto-injector", "avoid", "covered", "perfume", "bright colors", "first aid", "sweet drinks", "flowering", "lids"]]}}
+      }
+    },
+    "health": {
+      "questions": ["What should I pack for a long day hike?",
+                    "Suggest a fun night out for this weekend.",
+                    "Any tips for my first half marathon next month?"],
+      "conflict": "diabet|insulin|glucose|blood sugar|migraine|headache",
+      "values": {
+        "t1_diabetes": {"fact": "they have type 1 diabetes",
+          "mentions": {"all_of": [["diabet", "insulin", "blood sugar", "glucose", "cgm", "hypoglyc", "low blood sugar"]]},
+          "acts": {"all_of": [["diabet", "insulin", "blood sugar", "glucose", "cgm", "hypoglyc"],
+                              ["snack", "carb", "glucose tab", "juice", "sugar", "check", "monitor", "meter", "insulin"]]}},
+        "migraine_light": {"fact": "bright light triggers their migraines",
+          "mentions": {"all_of": [["migraine", "bright light", "light sensitiv", "sensitive to light", "photosensitiv", "photophobia"]]},
+          "acts": {"all_of": [["migraine", "bright light", "light sensitiv", "sensitive to light", "photosensitiv", "photophobia"],
+                              ["sunglasses", "shade", "dim", "low light", "low-light", "hat", "cap", "strobe", "tinted", "indoor", "overcast", "avoid"]]}}
+      }
+    },
+    "no_car": {
+      "questions": ["Plan me a weekend getaway.",
+                    "I'm moving to a new apartment across town - how should I plan the move?",
+                    "What's the best way to do a big monthly grocery stock-up?"],
+      "conflict": "\\bmy car\\b|i drive|i drove|driver'?s licen|road trip|\\bdriving\\b",
+      "values": {
+        "no_car": {"fact": "they don't have a car",
+          "mentions": {"all_of": [["don't have a car", "do not have a car", "no car", "without a car", "car-free", "car free", "don't own a car", "without your own car", "carless"]]},
+          "acts": {"all_of": [["train", "bus", "transit", "public transport", "subway", "rideshare", "ride-share", "uber", "lyft", "taxi", "delivery", "deliver", "bike", "walkable", "without a car", "car-free", "movers", "moving company"]],
+                   "none_of": ["road trip", "drive to", "drive up", "scenic drive", "you can drive", "drive there", "load up your car", "your car", "your trunk"]}},
+        "no_license": {"fact": "they never got a driver's license",
+          "mentions": {"all_of": [["license", "licence", "don't drive", "do not drive", "can't drive", "non-driver", "without driving", "no car"]]},
+          "acts": {"all_of": [["train", "bus", "transit", "public transport", "subway", "rideshare", "ride-share", "uber", "lyft", "taxi", "delivery", "deliver", "bike", "walkable", "movers", "moving company"]],
+                   "none_of": ["road trip", "drive to", "drive up", "scenic drive", "you can drive", "drive there", "rent a car", "car rental", "rent a truck", "rent a van", "load up your car", "your car", "your trunk"]}}
+      }
+    },
+    "toddler": {
+      "questions": ["Plan me a relaxing Saturday.",
+                    "How should I redecorate my living room?",
+                    "Plan me a weekend getaway."],
+      "conflict": "toddler|\\bmy (son|daughter|kid|kids|baby|child)\\b|newborn|infant",
+      "values": {
+        "toddler": {"fact": "they have a two-year-old at home",
+          "mentions": {"all_of": [["toddler", "two-year-old", "2-year-old", "little one", "kid", "child", "son", "daughter"]]},
+          "acts": {"all_of": [["toddler", "two-year-old", "2-year-old", "little one", "kid", "child", "son", "daughter"],
+                              ["family-friendly", "kid-friendly", "child-friendly", "toddler-friendly", "childproof", "child-proof", "baby-proof", "babyproof", "nap", "stroller", "babysitter", "sitter", "safe", "playground", "rounded", "durable", "washable"]]}},
+        "newborn": {"fact": "they have a newborn baby",
+          "mentions": {"all_of": [["newborn", "baby", "infant"]]},
+          "acts": {"all_of": [["newborn", "baby", "infant"],
+                              ["nap", "sleep", "feeding", "stroller", "babysitter", "sitter", "nearby", "baby-friendly", "baby-proof", "babyproof", "quiet", "safe", "rest", "nursery", "short"]]}}
+      }
+    },
+    "flying": {
+      "questions": ["Plan me a trip from New York to Chicago for a long weekend.",
+                    "My cousin's wedding is in Miami next month - help me plan the trip.",
+                    "Plan me a week-long vacation somewhere warm."],
+      "conflict": "\\bflights?\\b|\\bfly(ing)?\\b|airport|plane",
+      "values": {
+        "fear_flying": {"fact": "they are terrified of flying",
+          "mentions": {"all_of": [["afraid of flying", "fear of flying", "scared of flying", "terrified of flying", "nervous flyer", "don't fly", "won't fly", "not flying", "avoid flying", "without flying", "flying anxiety", "aviophobia", "no flights", "fear of flight", "flight anxiety"]]},
+          "acts": {"all_of": [["train", "amtrak", "bus", "greyhound", "drive", "driving", "road trip", "ferry", "cruise", "overland", "rail"]],
+                   "none_of": ["book a flight", "book your flight", "book flights", "fly into", "fly to", "flight to", "nonstop flight", "direct flight", "round-trip flight", "roundtrip flight", "flights from", "flights to"]}},
+        "climate_flying": {"fact": "they stopped flying for climate reasons",
+          "mentions": {"all_of": [["climate", "carbon", "emission", "flight-free", "flight free", "don't fly", "won't fly", "not flying", "avoid flying", "without flying", "no flights", "stopped flying", "flight shame"]]},
+          "acts": {"all_of": [["train", "amtrak", "bus", "greyhound", "drive", "driving", "road trip", "ferry", "overland", "rail"]],
+                   "none_of": ["book a flight", "book your flight", "book flights", "fly into", "fly to", "flight to", "nonstop flight", "direct flight", "round-trip flight", "roundtrip flight", "flights from", "flights to"]}}
+      }
+    }
+  },
+  "topics": [
+    "fixing a wobbly desk chair", "choosing a font for a resume", "setting up two-factor authentication",
+    "removing sticky label residue from a glass jar", "learning Excel keyboard shortcuts", "writing a short bio for a work profile",
+    "understanding how solar panels work", "choosing a paint finish for a hallway", "syncing calendars between a phone and a laptop",
+    "learning to whistle with fingers", "how noise-cancelling headphones work", "organizing a bookshelf",
+    "naming files consistently at work", "writing a follow-up email after a job interview", "understanding what a CPU cache is",
+    "touching up paint on a scratched door frame", "learning basic calligraphy", "getting started with a Raspberry Pi",
+    "choosing a domain name for a personal website", "how earthquakes are measured", "writing a cover letter opening",
+    "removing a stripped screw", "choosing a sewing machine for beginners", "understanding git branches",
+    "framing a poster at home", "improving messy handwriting", "how rainbows form",
+    "learning to solve a Rubik's cube", "shortening a slideshow presentation", "how bioluminescence works",
+    "choosing a first fountain pen", "fixing a running toilet", "waterproofing a canvas backpack",
+    "cleaning up an overflowing email inbox", "learning Morse code", "choosing a standing desk",
+    "replacing a cracked light switch cover", "how a refrigerator keeps things cold", "starting a stamp collection",
+    "formatting citations in APA style", "fixing a zipper that keeps splitting", "choosing a mechanical pencil for drawing",
+    "understanding what website cookies are", "writing a funny limerick", "painting miniatures for a tabletop game",
+    "deciding between a tablet and a laptop for note-taking", "removing water rings from a wooden table", "learning to draw in perspective",
+    "how 3D printers work", "digitizing old paper documents", "choosing curtains for a bedroom",
+    "fixing a sticky dresser drawer", "how a compass works", "writing an honest product review",
+    "explaining what an API is", "choosing a beginner telescope", "re-grouting bathroom tiles",
+    "learning basic sign language", "organizing a junk drawer", "why phone batteries lose capacity",
+    "writing a thank-you message to a former teacher", "making a playlist for focusing at work", "choosing between a Mac and a Windows laptop",
+    "cleaning a smelly washing machine", "how magnets work", "learning to crochet a granny square",
+    "fixing a slow spreadsheet", "using a photo on a blog without breaking copyright", "labeling cables behind a desk",
+    "choosing a phone case", "learning the basics of the board game Go", "fixing peeling wallpaper",
+    "how bridges carry weight", "naming a fantasy novel character", "choosing a podcast microphone",
+    "setting up a whiteboard for weekly planning", "dealing with a noisy radiator", "what HTTP status codes mean",
+    "writing a short ghost story", "getting started with model trains", "replacing a cracked phone screen protector",
+    "how glaciers form", "picking a username for online gaming", "cleaning tarnished silver jewelry",
+    "bringing up a hard topic with a coworker", "choosing a watch strap", "inkjet vs laser printers",
+    "learning a simple card trick", "unclogging a vacuum cleaner", "how volcanoes erupt",
+    "writing alt text for images", "sorting a coin collection", "choosing a new pillow",
+    "how barcodes work", "learning shorthand note-taking", "replacing a doorknob",
+    "what a spreadsheet macro is", "fixing a scratched DVD", "planning a home office layout",
+    "choosing a font size for a presentation", "cleaning a laptop screen safely", "learning to read tarot cards for fun",
+    "starting a bullet journal", "how lightning forms", "picking a theme for a personal blog",
+    "fixing a squeaky floorboard", "learning to touch-type numbers", "how submarines dive",
+    "choosing a keyboard layout for a new language", "recovering a forgotten email password", "decorating a bare white wall",
+    "learning the basics of photo editing", "why the ocean is salty", "writing meeting notes that people read",
+    "choosing a color scheme for slides", "removing a stuck lightbulb", "learning to play harmonica",
+    "how fiber-optic internet works", "drafting a polite complaint to an online shop", "organizing a closet",
+    "learning to write in cursive again", "how hot air balloons work", "choosing a backup hard drive",
+    "repairing a torn book page", "how ants communicate", "picking a beginner drawing tablet",
+    "writing a strong LinkedIn headline", "fixing a door that won't latch", "how pearls form",
+    "learning basic knots", "choosing a monitor arm", "explaining recursion simply",
+    "starting a vinyl record collection", "how sundials tell time", "removing scuff marks from walls",
+    "creating a family tree", "how noise affects concentration at work", "choosing frames for a photo wall",
+    "understanding what a spreadsheet pivot chart is", "learning to play the kalimba", "how ink is made"
+  ]
+}
