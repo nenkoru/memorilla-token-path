@@ -32,6 +32,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="rater_train27.json")
     ap.add_argument("--exclude", default="", help="comma-separated earlier outputs: their requests are not drawn again")
+    ap.add_argument("--same-as", default="", help="rate the requests of this earlier output (e.g. rater_train27.json) instead of drawing new ones")
+    ap.add_argument("--hard", action="store_true",
+                    help="test 50: candidates by closeness to the request instead of the saved random ones: 12 of the 50 pool "
+                         "facts nearest to the request (cosine) and 12 of ranks 50-1000, plus the known relevant ones")
     args = ap.parse_args()
     from transformers import AutoTokenizer
     K = PF.poc()
@@ -42,7 +46,28 @@ def main():
     done = {r["q"] for f in filter(None, args.exclude.split(",")) for r in json.loads((K.OUT / f).read_text())}
     pool = sorted(q for q in by if q not in done)
     reqs = random.Random(args.seed).sample(pool, min(args.requests, len(pool)))
+    if args.same_as:
+        reqs = sorted({r["q"] for r in json.loads((K.OUT / args.same_as).read_text())} & set(by))
     jobs = [r for q in reqs for r in by[q]]
+    if args.hard:
+        import poc_broad as B
+        _, qvec, fvec, _ = B.load_all()
+        facts = sorted({r["f"] for v in by.values() for r in v if r["f"] in fvec})
+        F = np.stack([fvec[f] for f in facts]).astype(np.float32)
+        F /= np.linalg.norm(F, axis=1, keepdims=True) + 1e-9
+        rng, jobs, cs = random.Random(args.seed + 1), [], []
+        for q in reqs:
+            if q not in qvec:
+                continue
+            known = [r for r in by[q] if r["known"]]
+            kf = {r["f"] for r in known}
+            v = np.asarray(qvec[q], dtype=np.float32)
+            cos = F @ (v / (np.linalg.norm(v) + 1e-9))
+            order = [i for i in np.argsort(-cos)[:1100] if facts[i] not in kf]
+            pick = rng.sample(order[:50], 12) + rng.sample(order[50:1000], 12)
+            cs += [float(cos[i]) for i in pick]
+            jobs += known + [{"q": q, "f": facts[i], "s": None, "known": False} for i in pick]
+        print(f"RATE27 hard candidates: mean cosine to the request {np.mean(cs):.3f} (90th pct {np.percentile(cs, 90):.3f})", flush=True)
     tx = W.Text(AutoTokenizer.from_pretrained(os.environ.get("MPORT_RATER_TOK", K.DECODER)))
     pr = PROMPTS[args.prompt]
     assert "{f}" not in pr, "fact-last wordings are not supported here"
@@ -50,6 +75,11 @@ def main():
     sc = W.yes_score(tx, [tx.msgs([r["f"]], pr.format(q=r["q"])) for r in jobs])
     out = [{"q": r["q"], "f": r["f"], "s": round(s, 3), "known": r["known"], "s8": r["s"]} for r, s in zip(jobs, sc)]
     (K.OUT / args.out).write_text(json.dumps(out))
+    if args.hard:
+        s, kn = (np.array([o[k] for o in out]) for k in ("s", "known"))
+        print(f"RATE27 rated {len(out)} pairs in {time.perf_counter() - t0:.0f}s; known relevant {s[kn].mean():.2f}, close candidates {s[~kn].mean():.2f};"
+              f" says Yes to {np.mean(s[~kn] > 0):.2f} of the close candidates", flush=True)
+        return
     s, s8, kn = (np.array([o[k] for o in out]) for k in ("s", "s8", "known"))
     print(f"RATE27 rated {len(out)} pairs in {time.perf_counter() - t0:.0f}s; known relevant {s[kn].mean():.2f}, random {s[~kn].mean():.2f};"
           f" correlation with the 8B {np.corrcoef(s, s8)[0, 1]:.2f}", flush=True)

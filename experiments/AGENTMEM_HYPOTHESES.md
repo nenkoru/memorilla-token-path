@@ -916,7 +916,7 @@ LoRA r16 on q/k/v/o of the decoder, Muon, 320 steps (30 min on one V100). Each s
 
 ### 41. A bigger rater: production's 27B picks the facts, the 8B answers
 
-Approved by the user 2026-11-23. `~/models/<qwen-27b>` (on disk, read-only), my own vLLM process from production's venv, both V100s (TP 2), port 8150 (`experiments/v100.sh serve27`; not production's production's launch script). The 27B only rates (one yes/no token per fact, thinking off, its own chat template); the 8B decoder writes every answer. [poc_rate_sweep.py](poc_rate_sweep.py) with `MPORT_VLLM_MODEL=qwen3-27b MPORT_RATER_TOK=<27B dir>`; `rate27.json`, `rate27_s192.json`, `zero_r27_fixed.json`, `zero_saved_fixed.json`.
+Approved by the user 2026-11-23. `~/models/<qwen-27b>` (on disk, read-only), my own vLLM process from production's venv, both V100s (TP 2), port 8150 (`experiments/v100.sh serve27`; not production's launch script). The 27B only rates (one yes/no token per fact, thinking off, its own chat template); the 8B decoder writes every answer. [poc_rate_sweep.py](poc_rate_sweep.py) with `MPORT_VLLM_MODEL=qwen3-27b MPORT_RATER_TOK=<27B dir>`; `rate27.json`, `rate27_s192.json`, `zero_r27_fixed.json`, `zero_saved_fixed.json`.
 
 Where the clue ranks, unseen types (192 facts: every third profile, 96 requests):
 
@@ -1086,6 +1086,384 @@ Answers from the picked blocks (the column header shows how many facts the reade
   - It is still well below its 27B teacher, so the student is no longer the only limit. That leaves room to grow: more labelled requests, or more passes.
   - One run, 106 eval requests.
 - **Next (running 2026-11-25).** 2,000 more requests (50,213 pairs) for the 27B to label, none overlapping the first 1,000 (`--exclude`). The reader is tested on `r27w`'s picks: the current reader, and one trained with the clue at a random place among 1-4 blocks ([run_box_reader.sh](run_box_reader.sh); 4-bit training via `poc_fast.lean_loss_batch`, checked against the plain loss in [reader_check.py](reader_check.py)).
+- **Result, 3x the labels (`r27all`, 2026-11-25).** 2,950 requests (75,309 pairs), 1,475 steps from test 45's LoRA, 73 min, peak 1.64 GiB.
+  - Val spearman 0.736, up from 0.716. The eval got worse: from 8: 0.45 / 0.66 / 0.80; from 16: 0.28 / 0.48 / 0.65 (first / top 2 / top 4); from 48: first 0.15, top 4 0.47, top 8 0.58.
+  - This is the same pattern as the 650-step control: more steps fit the training types and hurt the held-out wording types.
+  - Next: the same 3x data at r27w's 485 steps (`r27a485`), to separate more data from more steps.
+- **Result: same steps, 3x the data (`r27a485`).** From 8 / 16 / 48, clue first 0.49 / 0.35 / 0.24, top 4 0.82 / 0.66 / 0.46. Val spearman 0.686.
+- **Result: `r27w` replicated with another training order (`--seed 1`, `r27ws1`).** Clue first 0.48 / 0.33 / 0.22, top 4 0.82 / 0.69 / 0.47. Val spearman 0.724.
+  - **`r27w` was a lucky run.** On "clue first", runs of the same recipe differ by about 0.13 at 8 facts.
+  - Over the five 27B-taught runs (`r27`, `r27w`, `r27ws1`, `r27a485`, `r27all`), mean clue first from 8 is 0.51. That equals the 8B-taught rater (test 45), so the 27B teacher does not help "first".
+  - Top 4 of 48 averages 0.48 against 0.43 for the 8B-taught rater (one run), a small gain at most.
+  - Averaging the five tables (`poc_tok.py ensemble`, each z-scored) gives clue first 0.55 / 0.40 / 0.28 and top 4 0.85 / 0.72 / 0.52: about the runs' mean, not better than the best run.
+  - Caveats: the stride-3 eval has 106 requests, and runs drift. Comparisons under about 0.1 on "first" are not readable. Test 48's reader rows used the lucky `r27w` table.
+  - Next: re-rate the 8B-taught rater, `r27w` and `r27ws1` on the full eval set (stride 1), where two thirds of the questions are new to the comparison ([run_box_s1.sh](run_box_s1.sh)).
+- **Result: full eval set (stride 1, about 3x the questions; tables `tokL<tag>_full_change`, [run_box_s1.sh](run_box_s1.sh)).**
+
+| Rater, full eval set | from 8: first / top 2 / top 4 | from 16: first / top 2 / top 4 | from 48: first / top 4 / top 8 |
+|---|---|---|---|
+| 8B labels (test 45, `q4`) | 0.45 / 0.62 / 0.81 | 0.34 / 0.47 / 0.64 | 0.17 / 0.41 / 0.55 |
+| 27B labels, `r27w` | **0.56 / 0.72 / 0.86** | **0.43 / 0.56 / 0.72** | **0.26 / 0.51 / 0.66** |
+| 27B labels, same recipe, seed 1 (`r27ws1`) | 0.46 / 0.66 / 0.83 | 0.35 / 0.47 / 0.65 | 0.17 / 0.43 / 0.57 |
+
+  - `r27w` holds up on the two thirds of questions it was not picked on, so it is a better checkpoint. But its recipe is not reliably better: the replicate is level with the 8B-taught rater.
+  - The 27B teacher helps some runs, not every run. Val spearman does not tell which (`r27ws1` 0.724, `r27w` 0.716).
+  - `r27w` stays the rater for the reader tests.
+
+### 48. The reader on the box, end to end on `r27w`'s picks (V100 box, 2026-11-25)
+
+[run_box_reader.sh](run_box_reader.sh), [poc_tok.py](poc_tok.py) `answer --tables tokLr27w_change --stride 3`; logs `v100_rd_*`.
+
+- **Training on the box.**
+  - The reader trains 4-bit and offloaded on one GPU with `poc_fast.lean_loss_batch`: packed forward, loss only at answer positions in checkpointed chunks, 4-bit output layer on the GPU, memory core on the CPU.
+  - Against the plain loss: diffs ≤ 0.0005. LoRA gradient with and without checkpointing: cosine 1.00000.
+  - A step of 4 examples (~550 tokens) takes 1.5 s, peak 1.32 GiB ([reader_check.py](reader_check.py)).
+- **`rpos`.** 75 minutes from `lora_lsort.pt`, the same recipe without `--sort`, so the clue sits at a random place among 1-4 blocks. Half the distractors are map look-alikes.
+- **Results.** Acts on the clue, held-out types, n = 96 per row.
+
+| condition | current reader `lsort` | `rpos` |
+|---|---|---|
+| clue alone | **0.64** | 0.52 (writes "none" 0.27) |
+| whole profile of 8 | 0.33 | 0.40 |
+| top 1 of 8 / 16 / 48 | 0.48 / 0.39 / 0.31 | 0.43 / 0.39 / 0.35 |
+| top 2 of 8 / 16 / 48 | 0.43 / 0.40 / 0.32 | 0.44 / 0.38 / 0.30 |
+| top 4 of 8 / 48 | 0.45 / 0.27 | 0.45 / 0.31 |
+| top 2 of 8, clue removed | 0.14 | 0.22 |
+
+- **Reading.**
+  - End to end, the 27B-taught rater lifts the blog's result. With the current reader, top 1 of 8 gives 0.48 (blog: 0.44), and 48 facts give about 0.31 (blog: about 0.30).
+  - The reader is now the limit. It acts on 0.64 with the clue alone, while the plain decoder reading the clue as text gets 0.81 (test 20).
+  - Training with the clue at a random place does not help. Each row moves within one standard error (about 0.05), except clue alone, which falls to 0.52.
+  - `rpos` writes "none" for a quarter of lone clues. This is the same failure as test 23: look-alike distractors teach "none".
+- **Next (running).** Context distillation, `poc_broad.py train --kd 1.0` with `poc_fast.kd_loss_batch`.
+  - Same recipe as `rpos`. The answer tokens learn the full next-token distribution of the same 8B with the LoRA off, reading the same facts as text in block order. The KL is computed in the same checkpointed chunks.
+  - The recite line keeps cross-entropy.
+  - This targets the 0.64 vs 0.81 gap directly. [kd_check.py](kd_check.py) checks the token alignment and that alpha=0 equals the plain loss.
+
+### 49. Context distillation: the token reader learns from the same 8B reading the facts as text (V100 box, 2026-11-25)
+
+[poc_fast.py](poc_fast.py) `kd_loss_batch`, `poc_broad.py train --kd 1.0`, [kd_check.py](kd_check.py), [run_box_kd.sh](run_box_kd.sh); logs `v100_kd_*`, `v100_rd_ans_kd3`.
+
+- **Method.**
+  - The same recipe as `rpos` (test 48): from `lora_lsort.pt`, long answers with the recite line, 1-4 blocks in random order, 75 minutes.
+  - On the answer tokens the loss is KL(teacher || reader), where the teacher is the same 8B with the LoRA off. It reads the same facts as text, in block order, in the text-control prompt (persona system prompt, facts then the request). The teacher pass is a no-grad packed forward; its hidden states go through the same 4-bit output layer in the loss chunks.
+  - The recite line keeps cross-entropy.
+- **Check.**
+  - Answer tokens align for 16 of 16 examples, and alpha=0 equals the plain loss to 4 decimals.
+  - Cross-entropy on these (training) answers: text teacher 1.06, current reader 0.27. The old reader has partly memorised its targets.
+  - A step takes 1.8 s, peak 2.2 GiB. Training: 801 updates, loss 1.41 → 0.17. On training-style examples with the fact present it writes "none" 0.05 of the time.
+- **Results.** Acts on the clue, held-out types, n = 96, `r27w` picks.
+
+| condition | `lsort` (test 48) | `rpos` (same recipe, no KD) | **`kd`** |
+|---|---|---|---|
+| clue alone | 0.64 | 0.52 | **0.67** |
+| whole profile of 8 | 0.33 | 0.40 | **0.47** |
+| top 1 of 8 / 16 / 48 | 0.48 / 0.39 / 0.31 | 0.43 / 0.39 / 0.35 | 0.41 / 0.32 / 0.31 |
+| top 2 of 8 / 16 / 48 | 0.43 / 0.40 / 0.32 | 0.44 / 0.38 / 0.30 | **0.58 / 0.46 / 0.35** |
+| top 4 of 8 / 48 | 0.45 / 0.27 | 0.45 / 0.31 | **0.49 / 0.36** |
+| top 2 of 8, clue removed | 0.14 | 0.22 | 0.18 |
+
+- **Reading.**
+  - Distillation helps the reader with several blocks. Top 2 of 8 rises from 0.43-0.44 to 0.58, about 3 standard errors. This is the best end-to-end number on the token path so far (blog: 0.44).
+  - The whole profile of 8 rises to 0.47, and top 4 of 48 to 0.36. Mentions of the clue rise everywhere (clue alone 0.81).
+  - Top 1 falls slightly (0.41 vs 0.48 at 8, within noise).
+  - Once the clue is shown, the reader acts about as often as with the clue alone: top 1 of 8 acts 0.41 with the clue shown 0.61. The limit at 16 and 48 facts is now the rater's recall.
+  - Not explained yet: the first sample writes "Relevant fact: none" and still acts on the diabetes fact. The recite line and the answer now disagree at times.
+- **More picks (`kd`).**
+  - Top 3 of 8: 0.56 (clue shown 0.82). Top 4 of 16: 0.47 (0.78). Top 8 of 16: 0.47 (0.91). Top 8 of 48: **0.43** (0.70).
+  - With the clue removed, top 8 of 16 acts 0.22 and top 8 of 48 acts 0.21, so the clue adds about +0.25 at 16 and +0.22 at 48. The reader keeps working with 8 blocks, though it was trained on at most 4.
+- **`kdsort`: the same with blocks sorted by score (like `lsort`; `EXTRA=--sort`).** Training check: writes "none" 0.08.
+
+| condition | `lsort` | `kd` | **`kdsort`** |
+|---|---|---|---|
+| clue alone | 0.64 | 0.67 | **0.78** (text reader, test 20: 0.81) |
+| whole profile of 8 | 0.33 | 0.47 | 0.43 (writes none 0.52) |
+| top 1 of 8 / 16 / 48 | 0.48 / 0.39 / 0.31 | 0.41 / 0.32 / 0.31 | **0.55 / 0.46 / 0.35** |
+| top 2 of 8 / 16 / 48 | 0.43 / 0.40 / 0.32 | 0.58 / 0.46 / 0.35 | **0.58 / 0.53 / 0.39** |
+| top 4 of 8 / 48 | 0.45 / 0.27 | 0.49 / 0.36 | 0.53 / 0.39 |
+| top 2 of 8, clue removed | 0.14 | 0.18 | 0.15 |
+
+- **Reading, `kdsort`.**
+  - Distillation and sorted training add up. On the clue alone, the token reader is now within 0.03 of the 8B reading the fact as text.
+  - Every rater-picked row is the best so far. Top 2 of 16 is 0.53 against 0.40, and at 48 it reaches 0.35-0.39 where the blog had about 0.30.
+  - Writing "none" with the unsorted whole profile of 8 (0.52) is the sorted reader's known weakness: it expects the best block first.
+- **More picks (`kdsort`).**
+  - Top 3 of 8: **0.59** (writes none 0.22). Top 4 of 16: 0.46.
+  - Top 8 of 16: 0.39, and top 8 of 48: 0.34 (clue removed 0.17); with 8 blocks it writes "none" 0.36.
+  - The sorted reader, trained on at most 4 blocks, does not carry over to 8 as `kd` does.
+  - Best per profile size so far: 8 facts, `kdsort` top 3 0.59; 16, `kdsort` top 2 0.53; 48, `kd` top 8 0.43 (clue removed 0.21).
+- **Next (running).**
+  - `kds8`: `kdsort` trained on up to 8 blocks (`--max-facts 8`).
+  - `kdsort` on the full eval set (stride 1, about 3x n) for its main rows, with `r27w`'s full table.
+- **Result, full eval set (n = 288 held-out per row), `kdsort`.**
+  - Clue alone **0.80** (text reader 0.81).
+  - Top 2 of 8: 0.52; top 3 of 8: 0.52; top 2 of 16: 0.43; top 4 of 48: 0.34.
+  - Top 2 of 8 with the clue removed: 0.14.
+  - The stride-3 rows were optimistic by 0.05-0.10 (noise at n = 96).
+
+| full eval set, n = 288, `r27w` full table | `lsort` | **`kdsort`** | gain |
+|---|---|---|---|
+| clue alone | 0.60 | **0.80** | +0.20 |
+| top 2 of 8 | 0.40 | **0.52** | +0.12 |
+| top 3 of 8 | 0.39 | **0.52** | +0.13 |
+| top 2 of 16 | 0.36 | **0.43** | +0.07 |
+| top 4 of 48 | 0.27 | **0.34** | +0.07 |
+| top 2 of 8, clue removed | 0.12 | 0.14 | |
+
+  - The standard error of a difference here is about 0.04. The gains at 8 facts and on the clue alone are solid; at 16 and 48 they are about 2 SE.
+- **`kds8` (`kdsort` on up to 8 blocks; 1,093 updates; training check writes none 0.03), stride 3.**
+  - Clue alone 0.79. Top 1 of 8 / 16 / 48: 0.50 / 0.42 / 0.32. Top 2: 0.55 / 0.47 / 0.38. Top 4 of 8 / 48: 0.55 / 0.34. Clue removed 0.21.
+  - Whole profile of 8: 0.44, writing "none" only 0.16 (`kdsort` 0.52). The same as `kdsort` on 1-4 blocks, and the 8-block weakness is gone.
+- **Result: `kds8` with more picks, full set (n = 288).**
+
+| picks | clue shown | acts | clue removed |
+|---|---|---|---|
+| top 8 of 16 | 0.88 | 0.40 | |
+| top 8 of 48 | 0.66 | **0.37** | 0.20 |
+| top 16 of 48 | 0.79 | 0.35 | |
+| (`kdsort` top 2 of 16 / top 4 of 48, for reference) | 0.56 / 0.51 | 0.43 / 0.34 | |
+
+  - Letting the reader filter more blocks barely helps. The clue is shown more often (0.51 → 0.66 → 0.79 at 48), but each extra block dilutes the reader, and acts with the clue removed rise with the number of blocks (0.14 at 2, 0.20 at 8).
+  - The reader's act rate when the clue is among 8 blocks is about (0.37 - 0.34 × 0.20) / 0.66 ≈ 0.46, against 0.80 when the clue is alone.
+  - The limit at 16-48 facts is now the reader's focus among distractors, more than the rater's recall. The 8B teacher reading the same 8 facts as text is probably just as distracted, so a better teacher (27B answers) is the next lever, not more blocks.
+- **Result: `kds16` (up to 16 blocks, 700 updates), stride 3, n = 96.**
+  - Clue alone 0.78. Top 1 of 8 / 16 / 48: 0.48 / 0.35 / 0.27. Top 2: 0.61 / 0.53 / 0.43. Top 4 of 8 / 48: 0.60 / 0.33. Whole profile of 8: 0.49. Clue removed 0.23.
+  - Within noise of `kds8` and `kdsort` at this n. Training on more blocks alone does not change the picture.
+- **Where the gap is (text results from test 41, same 288 questions).**
+  - Text pipeline, 27B picks and the 8B reads the picks as text: 0.68 / 0.62 / 0.53 at 8 / 16 / 48. Token path: 0.52 / 0.43 / 0.37. Clue alone: 0.80 both ways, so the 16 tokens lose nothing.
+  - Acting on the clue when it is among the facts shown (floor subtracted, estimates): text 8B about 0.78 among 2 and 0.71 among 4; token reader about 0.67 among 2, 0.50 among 4, 0.46 among 8.
+  - The reader is below its own teacher once there are several blocks, and that is the larger share of the gap at 48 (reader fixed: about 0.45; rater fixed: about 0.39; both: 0.53).
+- **Result: clean teacher (`kdc8`, `--kd-clean`), full set, n = 288. False.**
+  - `kdc8` is `kds8` with a teacher that reads only the fact that matters, while the reader gets it among up to 8 blocks. 880 updates, training loss 0.088 (`kds8` 0.163).
+
+| full set | `kds8` | `kdc8` (clean teacher) |
+|---|---|---|
+| clue alone | 0.77 | 0.75 |
+| top 2 of 8 | 0.51 | 0.49 |
+| top 3 of 8 | (`kdsort` 0.52) | 0.40 |
+| top 2 of 16 | 0.41 | 0.40 |
+| top 4 of 48 | **0.34** | 0.28 |
+| top 8 of 16 | **0.40** | 0.36 |
+| top 8 of 48 | **0.37** | 0.27 |
+| clue removed: top 2 of 8 / top 8 of 48 | 0.18 / 0.20 | 0.19 / 0.15 |
+
+  - The clean teacher is worse wherever there are 3 or more blocks.
+  - Likely cause: with a clean teacher the LoRA itself must learn which block matters, from 2,735 rows of the training types, and that choice does not carry over to unseen types. It fits the training types better (loss 0.088). The rater has the same problem.
+  - With the teacher reading every fact, the reader only has to pass the facts on, and the base model's own judgement picks. That carries over.
+  - Lesson: train the reader to be faithful to the text, and leave the judging to the base model.
+- **Result: text control on the same picks, full set, n = 288.** The plain 8B (LoRA off) reads `r27w`'s picks as text (`poc_tok.py answer --text`, outputs `tok_answer_text_full_a.json` and `_b.json`). The standard error of a difference is about 0.04.
+
+  | Condition | Clue shown | Text (plain 8B) | Tokens (`kds8`) | Tokens (`kdsort`) |
+  |---|---|---|---|---|
+  | clue alone | 1.00 | 0.86 | 0.77 | 0.80 |
+  | top 2 of 8 | 0.72 | 0.54 | 0.51 | 0.52 |
+  | top 3 of 8 | 0.81 | 0.57 | | 0.52 |
+  | top 2 of 16 | 0.56 | 0.43 | 0.41 | 0.43 |
+  | top 4 of 48 | 0.51 | 0.35 | 0.34 | 0.34 |
+  | top 8 of 16 | 0.88 | 0.46 | 0.40 | |
+  | top 8 of 48 | 0.66 | 0.35 | 0.37 | |
+  | top 2 of 8, clue removed | 0 | 0.12 | 0.18 | 0.14 |
+  | top 8 of 48, clue removed | 0 | 0.18 | 0.20 | |
+
+  - The token reader is at its text ceiling for the same picks: within 0.03 in the top-2 and top-4 rows and at top 8 of 48. The open gaps are the clue alone (0.06-0.09) and 8 facts from 16 (0.06), each about two standard errors or less.
+  - More distillation data for the reader (plan step 2) can therefore win at most about 0.05. Dropped as the next step.
+  - The ceiling itself is low because the plain 8B loses the clue among other facts: with the clue present in 88% of the top 8 of 16 it acts 0.46, against 0.86 when the clue is alone.
+  - So two things cap the path now: how often the rater puts the clue first (0.56 / 0.43 / 0.26 at 8 / 16 / 48), and the 8B's own use of a clue that sits among distractors. The 27B picking gives 0.68 / 0.62 / 0.53 with the same 8B reading (test 41).
+- **Result: the 27B reads the same picks as text** (`poc_tok.py answer --text-url`, production's 27B as a polite client, `tok_answer_text27.json`; every second question, n = 144 held-out, all three readers on the same questions).
+
+  | `r27w` picks | Clue shown | 27B, text | 8B, text | `kds8`, tokens | 27B / 8B when the clue is shown |
+  |---|---|---|---|---|---|
+  | clue alone | 1.00 | 0.89 | 0.88 | 0.76 | 0.89 / 0.88 |
+  | top 2 of 8 | 0.66 | 0.55 | 0.48 | 0.42 | 0.80 / 0.72 |
+  | top 4 of 48 | 0.49 | 0.43 | 0.33 | 0.32 | 0.81 / 0.60 |
+  | top 8 of 16 | 0.89 | 0.65 | 0.42 | 0.35 | 0.73 / 0.48 |
+  | top 8 of 48 | 0.61 | 0.47 | 0.32 | 0.36 | 0.75 / 0.49 |
+  | top 2 of 8, clue removed | 0 | 0.16 | 0.07 | 0.14 | |
+
+  - With the clue alone the two models act equally often (0.89 and 0.88). The 27B's advantage is keeping the clue among other facts: with the clue among 8 shown facts it acts 0.73-0.75 against the 8B's 0.48-0.49.
+  - So a reader taught by the 27B's answers (not the 8B's) has room of about +0.10 with 4 facts and +0.15 to +0.23 with 8 facts on the same picks. Whether the 8B's weights can learn it is untested.
+  - The 27B's floor is also higher (0.16 against 0.07 with the clue removed), so about 0.05-0.09 of its gain in the top-2 row may be guessing.
+- **Result: question-vector control, full set, n = 288, reader `kds8`** (`tok_answer_bq_wrong.json`, `tok_answer_bq_mean.json`).
+
+  | Question vector given to the core | Clue alone | Restates the clue first | Top 2 of 8 | Top 2 of 8, clue removed |
+  |---|---|---|---|---|
+  | the right question | 0.77 | 0.58 | 0.51 | 0.18 |
+  | another question's | 0.74 | 0.56 | 0.57 | 0.14 |
+  | the average of all questions | 0.76 | 0.51 | | |
+
+  - The question vector does not matter to the reader: all differences are within noise (about 0.04 per difference).
+  - What the reader gets from a block is the fact. The gain over the floor (0.14-0.18) comes from the fact's content, not from the question re-encoded in the tokens, which is the doubt the Gemma port raised for PV4.
+  - Consequence: a fact's 16 tokens can be built once when the fact is stored, with a fixed vector, and no core pass is needed per question. Not yet tested for the rater, whose table here was made from right-question blocks.
+- **Background.** Question-vector control (`poc_tok.py answer --block-q wrong|mean`), prompted by a public port of Memorilla to Gemma 4 that found wrong documents score as well as right ones on PV4. Each of our blocks is built by the core from the question vector and one fact. The control gives the core another question's vector (or the average of all) while the decoder still reads the right question as text.
+
+### 50. Why the rater ranks the clue low (2026-11-26, no model run)
+
+[rank_diag.py](rank_diag.py), CPU only, the 288 held-out questions. "Cosine" is the cosine between the question vector and the fact vector, a measure of plain topical closeness.
+
+| Rater | Clue first from 8 / 16 / 48 | Facts above the clue at 48 | Score follows cosine among distractors (Spearman) |
+|---|---|---|---|
+| cosine alone | 0.28 / 0.18 / 0.07 | | |
+| `r8_change` (8B, fact as text) | 0.48 / 0.28 / 0.16 | 9.0 | +0.16 to +0.20 |
+| `tokLq4_full_change` (blocks, 8B labels) | 0.45 / 0.34 / 0.17 | 10.9 | +0.19 to +0.23 |
+| `tokLr27w_full_change` (blocks, 27B labels) | 0.56 / 0.43 / 0.26 | 8.9 | +0.22 to +0.25 |
+| `r27_wrong` (27B, fact as text, the teacher) | 0.67 / 0.52 / 0.28 | 3.9 | +0.12 to +0.14 |
+
+- **The training set is easier than the eval in a specific way.** In `rater_train.json` a known-relevant fact has cosine 0.538 to its request and the other candidates 0.405, so cosine alone puts a relevant fact first in 0.50 of the requests (25 candidates). In the eval the clue has 0.477 and the distractors 0.444, and cosine alone puts the clue first in 0.07 of 48.
+- **The block rater leans on topical closeness about twice as much as its teacher** (+0.22-0.25 against +0.12-0.14), and it puts 8.9 facts above the clue at 48 where the teacher puts 3.9.
+- The two block raters agree with each other more (Spearman 0.83 over 48 facts) than either agrees with the 27B teacher (0.64-0.67).
+- The teacher is itself the ceiling of this recipe for "first": 0.67 / 0.52 / 0.28. At 48 the student already matches it on "first" and loses in the top 4 and top 8 (0.51 and 0.66 against 0.67 and 0.82).
+- Reading: candidates for training should be the facts closest to the request (hard negatives), not random pool facts. Tested in 53: no gain.
+
+### 51. A reader taught by the 27B's answers (V100 box, 2026-11-26)
+
+[poc_read27.py](poc_read27.py), `poc_broad.py train --mix27 FILE --p27 P`; logs `v100_read27`, `v100_read27far`, `v100_rd27_train_a|b`, `v100_rd_kd27a|b`.
+
+- **Why.** Test 49: with the clue among 8 shown facts the 27B acts 0.73-0.75 and the 8B 0.48-0.49; the token reader, taught by the 8B, equals the 8B.
+- **Data.** Training-type requests only (the 1,000 of `rater_train27h.json`). Per request two sets of 2-8 facts that are close to the request: one the 27B rated relevant (log-odds above 1) among ones it rated not relevant (below -1); 15% of the sets have no relevant fact. The 27B answers from the facts as text in the eval's prompt (200 new tokens, cut back to the last finished sentence).
+- **Training.** From `lora_kds8.pt`, 50 minutes, the `kds8` recipe. A share of the batches uses the 27B sets with plain cross-entropy on "Relevant fact: ..." plus the 27B's answer; blocks are in the 27B's score order, with the relevant block moved to a random place half the time.
+  - `kd27a`: half the batches use `read27.json` (the other half keeps the 8B distillation).
+  - `kd27b`: the same with `read27far.json` (below). The planned "all batches" run was dropped for it.
+- **What the 27B wrote (`read27.json`, 1,806 sets, 1,444 with a relevant fact, mean 5.0 facts, mean 108 words).** Words of 6+ letters that a fact has and the request does not, two or more of them in the answer:
+  - the relevant fact: 0.66 of the answers;
+  - at least one of the other facts: 0.67 (a given other fact: 0.35); with no relevant fact in the set: 0.84.
+  - 0.61 of the answers reached the 200-token limit and were cut back to their last finished sentence.
+  - Reading: the other facts are the closest ones to the request, and the 27B uses them although as a rater it scored them below -1. This set teaches "use what is close", not "find the one fact".
+- **`read27far.json` (`--far 1.0`).** Same requests and relevant facts; the other facts are drawn from the whole pool, so they are unrelated to the request, as in the buried-clue test. `kd27a` against `kd27b` then differs only in how close the other facts are.
+- **Check.** The rows of the 27B table in test 49 (every second question, n = 144), `r27w` picks. To beat: `kds8` 0.42 top 2 of 8, 0.32 top 4 of 48, 0.35 top 8 of 16, 0.36 top 8 of 48; the 27B itself 0.55 / 0.43 / 0.65 / 0.47.
+
+- **Training.** 50 minutes each: `kd27a` 742 updates, `kd27b` 802 (3.7 s per update). Training-style check: restates the fact word for word 0.47 and 0.42, never writes "none" when the fact is there.
+- **Result** ([cmp_readers.py](cmp_readers.py), log `v100_cmp`; the same 144 held-out questions for every reader, `r27w` picks; in brackets the paired difference to `kds8`, one standard error 0.04-0.05).
+
+| Picks shown | Clue shown | `kds8` | `kd27a` | `kd27b` | 8B text | 27B text |
+|---|---|---|---|---|---|---|
+| clue alone | 1.00 | 0.76 | 0.81 (+0.04) | 0.83 (+0.06) | 0.88 | 0.89 |
+| top 2 of 8 | 0.66 | 0.42 | 0.50 (+0.08) | 0.49 (+0.06) | 0.48 | 0.55 |
+| top 4 of 48 | 0.49 | 0.32 | 0.35 (+0.03) | 0.33 (+0.01) | 0.33 | 0.43 |
+| top 8 of 16 | 0.89 | 0.35 | 0.44 (+0.08) | 0.40 (+0.04) | 0.42 | 0.65 |
+| top 8 of 48 | 0.61 | 0.36 | 0.28 (-0.08) | 0.30 (-0.06) | 0.32 | 0.47 |
+| top 2 of 8, clue removed | 0 | 0.14 | 0.13 | 0.14 | 0.07 | 0.16 |
+
+- **Reading.** No reliable gain. Three conditions move up by one to two standard errors and top 8 of 48 moves down by as much; the mean over the four conditions with the clue among other facts is +0.03 for `kd27a` and +0.01 for `kd27b`. Both readers land on the 8B reading the same facts as text (0.48 / 0.33 / 0.42 / 0.32), not on the 27B (0.55 / 0.43 / 0.65 / 0.47). 1,800 answers from the 27B and 50 minutes did not take the 8B past its own reading of text.
+- **Close or unrelated other facts** (`kd27a` against `kd27b`): no difference beyond one standard error in any condition.
+- Not adopted on the keyword score. Scored again by the 27B judge in 54: `kd27a` is never lower and is higher with the clue alone, so it is the reader for new runs.
+
+### 52. Speed on the shared V100 (2026-11-26)
+
+[fast_gen.py](fast_gen.py), [q4_kernel_bench.py](q4_kernel_bench.py), [q4_reuse_check.py](q4_reuse_check.py), `q8.py` (`MPORT_Q4_REUSE`, `MPORT_Q4_FP16`), `box_chain.sh` (wait for several jobs); logs `v100_kbench`, `v100_q4reuse`, `v100_fg_selftest`.
+
+- **State of the box.** Production's 27B holds 23.8 GB on each GPU and other jobs 1.2-4.4 GB more (it changes within the hour), so 4-7 GB per GPU is free for this work; the cap for one job is 4.0 GB so that other people's jobs keep room. Both GPUs show 100% use whenever the 27B answers, including for my own data jobs.
+- **27B as a writer.** 16 requests at a time instead of 4 (still waiting whenever anyone else is queued): 1.1-1.6 s per answer against 2.6 s.
+- **Unpack kernel.** 15 Triton variants (no runtime division, scale loaded once per group, block sizes, warps), all bit-exact. Medians are all 5.4 ms for the four layer shapes, set by the GPU's time-slicing between processes; best runs are 1.0 ms (123 G weights/s, about 56 ms for the whole 8B), which is memory-bound. The kernel is not the limit; left unchanged.
+- **Backward pass keeps the unpacked weight (`MPORT_Q4_REUSE=1`).** With every layer checkpointed, a step unpacked each weight 4 times (first pass, recomputation, backward, teacher). The recomputation now hands its weight to the backward that follows: 3 times. Gradient identical (difference 0), about 0.4 GB more at the peak.
+  - First version was wrong: it kept the weight as a plain attribute, and the checkpoint's first pass (which runs with gradients on) kept every layer's weights, so the first training step ran out of memory. It now goes through `save_for_backward`, which the checkpoint drops in the first pass. `q4_reuse_check.py` checks all three: same gradient, nothing held after the forward pass, 3 -> 2 unpacks per layer.
+- **Decoding loop (`fast_gen.py`, `MPORT_FASTGEN=1` in `poc_tok.py answer`).** With 4-bit weights every decoding step unpacks (and, when offloaded, streams 4.6 GB of) every weight once whatever the batch, so speed is the batch size. `model.generate` also copies the whole key/value cache every step and repeats it 4x for grouped attention. The loop keeps keys and values in buffers allocated once, attends without repeating the keys, sorts prompts by length and takes the batch the free memory allows.
+  - Self-test, 16 prompts, 60 new tokens, same batch of 16: 16 of 16 answers identical to `model.generate`; 29.5 s against 35.6 s (1.2x), peak 1.75 GiB. 41 sequences fit where the old loop ran 16.
+  - A decoding step takes 425 ms whether the batch is 11 or 16, so answers per second is the batch size. With another batch split 14 of 16 answers are identical (first difference after 43 words: fp16 rounding with other padding).
+  - Real answer runs (300 new tokens, cap 4.0 GB): 25-35 answers per batch at 350-380 ms per step; 318 answers in 21.9 min, 4.1 s per answer against 7.6 s with the old loop (954 answers in 121.5 min).
+  - The memory core leaves the GPU once the blocks are built (25 -> 35 answers per batch). Prefilling 6,000 prompt tokens at a time overran the cap with 190-token prompts; it is 2,000 now.
+- **Where a decoding step goes (`fast_gen.py profile`, logs `v100_fg_profile`, `v100_fg_prof36`, `v100_fg_prof24`; 27B idle).** The packed layers are 3.64 GiB and cross the bus at 10.9 GiB/s: 341 ms per pass. Unpacking every weight takes 87 ms. A step takes 337 / 344 / 341 ms at batch 1 / 16 / 32, so an offloaded step is the bus transfer.
+- **Some layers kept on the GPU (`MPORT_RESIDENT_LAYERS=N`).** All 36 resident (+3.6 GiB): 251-265 ms per step, 1.35x. The floor without any transfer is about 255 ms at batch 1, so about 10 resident layers (1 GiB) already reach it. The same 1 GiB as batch gives 18 more sequences on 35 (1.5x), so memory goes to the batch first; left at 0. (A first test with 10 layers showed no change, 426 against 425 ms: the 27B was busy for my data job then and the step was limited by sharing, not by the bus.)
+  - Resident layers are given back when the GPU's free memory falls under `MPORT_MIN_FREE_GB` (1.5): this fired during the 24-layer test when another job took memory.
+- **Fewer generated tokens ([short_score.py](short_score.py), log `v100_short`).** Saved answers cut to their first N tokens and scored again. Not usable: at 200 tokens 4-9% of the answers score differently and acts falls by 0.02-0.08; at 150 by 0.10 or more. 0.98 of `kds8`'s answers, 0.65 of `kd27a`'s and 0.86 of the 27B's reach the 300-token limit, and acts still rises between 200 and 300, so the score depends on the limit. Every comparison must use the same limit.
+- **Memory core on the GPU (`MPORT_CORE_GPU=1`).** Reader training printed its time per update: building the blocks 4.82 s, forward 2.63 s, backward 2.35 s. The core ran on the CPU, and the box's CPUs are oversubscribed (load 30 on 16 cores). On the GPU (+0.8 GiB, peak 3.09 GiB): 0.15 s + 1.66 s + 1.89 s, so 3.7 s per update against 9.8 s (2.6x more updates in the same minutes).
+- **Kept unpacked (`MPORT_Q4_FP16=1`).** Unpack once and keep fp16 weights on the GPU: for a GPU with about 17 GB free. Not usable while production holds 24 GB.
+- **Blocks built once per fact (`s1_r27wmq`).** `r27w` rating blocks that were built with the mean question vector instead of each question's own: clue first 0.57 / 0.43 / 0.26 from 8 / 16 / 48, against 0.56 / 0.43 / 0.26. The rater does not need the question inside the block, so a fact's block can be computed once when the fact is stored and reused for every question. Not yet used in the pipeline, and not checked for the reader.
+- **Chains.** `box_chain.sh` waits for several jobs (`a,b`), so a job can wait for its data and for its GPU.
+
+### 53. Rater trained on the closest candidates, labelled by the 27B (V100 box, 2026-11-26)
+
+`rater_train27h.json` (log `v100_r27hard`), `poc_tokrater.py --data rater_train27h.json --steps 485 --init lora_tokrater_q4.pt`, two seeds; logs `v100_ab_r27h_train`, `v100_ab_r27hs1_train`, `v100_s1_r27h`, `v100_s1_r27hs1`.
+
+- **Why.** Test 50: the training candidates were easier than the eval's (cosine alone finds the relevant fact in 0.50 of the training requests, 0.07 of the eval's).
+- **Data.** The 1,000 training requests, each with the facts closest to it: 25,096 pairs rated by the 27B in 3,880 s. Mean cosine of the candidates 0.591. Mean log-odds: known-relevant facts -0.56, the close candidates -1.22; the 27B says Yes to 0.30 of the close candidates.
+- **Result, all 318 questions, clue first from 8 / 16 / 48 (and in the top 8 of 48).**
+
+| Rater | Seed 0 | Seed 1 |
+|---|---|---|
+| `r27w` (random candidates) | 0.56 / 0.43 / 0.26 (0.66) | 0.46 / 0.35 / 0.17 (0.57) |
+| `r27h` (closest candidates) | 0.47 / 0.34 / 0.20 (0.56) | 0.44 / 0.31 / 0.19 (0.55) |
+
+- Validation on its own data: Spearman 0.65 and 0.64, top fact in the top 3 for 0.83 and 0.80.
+- **Reading.** No gain: both seeds sit at the level of `r27w`'s weaker seed. Seeds of one recipe differ by 0.10, so neither recipe is separated from the other, and harder candidates did not move the rater toward its teacher (0.67 / 0.52 / 0.28). Not adopted.
+
+### 54. A 27B judge as the second score (production's 27B as a client, 2026-11-26)
+
+[judge27.py](judge27.py), log `v100_judge27`, cache `work/runs/poc/judge27.json`. The 27B reads the request, the clue and the reply and answers Yes or No to "does the reply take the fact into account" (Yes only if the reply would have to be different for a user without the fact, and nothing in it goes against the fact). The score is Yes at more than 0.5 of the Yes/No probability at the first token. 7,240 replies in 57 minutes, 8 at a time, production busy.
+
+- **Which score is better, without human labels.** A reply written without the clue cannot take it into account, so every pass on "clue removed" is a false alarm. Score with the clue alone minus score with the clue removed:
+
+| Reader | Keyword score | Judge |
+|---|---|---|
+| `kds8` | 0.77 - 0.18 = 0.59 | 0.93 - 0.05 = 0.89 |
+| `kd27a` | 0.81 - 0.13 = 0.67 | 0.99 - 0.05 = 0.94 |
+| `kd27b` | 0.83 - 0.14 = 0.69 | 0.98 - 0.03 = 0.95 |
+| 8B text | 0.86 - 0.12 = 0.74 | 0.99 - 0.02 = 0.97 |
+| 27B text | 0.89 - 0.16 = 0.73 | 1.00 - 0.04 = 0.96 |
+
+  - The judge is between 0.2 and 0.8 on 1-6% of the replies. The two scores agree on 0.75-0.95 of the replies in a condition.
+  - `kds8`'s 2,592 replies: judge Yes and keyword No with the clue shown 240; judge No and keyword Yes 165, of which 96 had no clue shown (keyword false alarms). Samples read: the judge's Yes replies use the fact in other words (a newborn, trains to avoid flying); the keyword's Yes replies hit a term while planning flights for a user afraid of flying.
+- **Judge score, the 144 questions every reader answered (difference to `kds8`, one standard error).**
+
+| Picks shown | Clue shown | `kds8` | `kd27a` | `kd27b` | 8B text | 27B text |
+|---|---|---|---|---|---|---|
+| clue alone | 1.00 | 0.92 | 0.99 (+0.06 +- 0.02) | 0.98 (+0.06 +- 0.03) | 1.00 (+0.08 +- 0.02) | 1.00 |
+| top 2 of 8 | 0.66 | 0.58 | 0.60 (+0.03 +- 0.03) | 0.58 | 0.62 (+0.05 +- 0.03) | 0.64 (+0.06 +- 0.03) |
+| top 4 of 48 | 0.49 | 0.38 | 0.40 | 0.36 | 0.37 | 0.47 (+0.08 +- 0.03) |
+| top 8 of 16 | 0.89 | 0.48 | 0.54 (+0.06 +- 0.05) | 0.52 | 0.56 (+0.08 +- 0.05) | 0.76 (+0.28 +- 0.05) |
+| top 8 of 48 | 0.61 | 0.37 | 0.38 | 0.38 | 0.38 | 0.56 (+0.19 +- 0.04) |
+| top 2 of 8, clue removed | 0 | 0.06 | 0.05 | 0.03 | 0.02 | 0.04 |
+
+  - 288 questions: top 2 of 16 `kds8` 0.51, 8B text 0.52; top 16 of 48 `kds8` 0.36; top 3 of 8 8B text 0.70; top 8 of 48 with the clue removed `kds8` 0.09, 8B text 0.06.
+- **Reading.**
+  - One fact in 16 memory tokens reaches the 8B decoder almost as well as the same fact as text: 0.92 (`kds8`), 0.99 (`kd27a`) against 1.00. The keyword score put this gap at 0.76 against 0.88.
+  - Among other facts the memory reader equals the 8B reading text in every condition (largest difference 0.08 +- 0.05).
+  - With 2 or 4 facts shown the score is close to the share of questions where the clue was shown (0.58 of 0.66, 0.38 of 0.49): the rater is the limit, and the 27B as reader adds 0.06-0.08.
+  - With 8 facts shown the 8B is the limit: it reaches 0.48-0.56 with the clue shown in 0.89, the 27B 0.76. From 48 facts, showing 4, 8 or 16 gives the same 0.36-0.38.
+  - The fall of `kd27a` at top 8 of 48 on the keyword score (-0.08) is not there on the judge (+0.01).
+- **How many facts to show (`kd27a`, logs `v100_rd_k8`, `v100_rd_k16`, `v100_judge_k`; 144 questions; clue shown / keyword / judge).**
+
+| Facts stored | top 2 | top 3 | top 4 | top 8 |
+|---|---|---|---|---|
+| 8 | 0.66 / 0.50 / 0.60 | 0.81 / 0.51 / 0.67 | 0.86 / 0.51 / 0.65 | |
+| 16 | (`kds8`: 0.41 / 0.51) | 0.62 / 0.43 / 0.53 | 0.68 / 0.41 / 0.56 | 0.89 / 0.44 / 0.54 |
+| 48 | | | 0.49 / 0.35 / 0.40 | 0.61 / 0.28 / 0.38 |
+
+  - 3 facts from 8 is the best point: 0.67, the same as the 8B reading those 3 facts as text (0.68). From 16 and 48 the count hardly matters (0.51-0.56 and 0.36-0.40): each added fact shows the clue more often and is used less often when shown (judge over clue shown: 0.83 at 3 of 8, 0.82 at 4 of 16, 0.61 at 8 of 16).
+- **Earlier answers scored again (log `v100_judge_old`; judge, difference to `kds8`).**
+  - The reader with the clean teacher, `kdc8` (plan step 1): clue alone 0.85 (-0.08 +- 0.04), top 2 of 8 0.37 (-0.21), top 2 of 16 0.36 (-0.15), top 4 of 48 0.17 (-0.21), top 8 of 16 0.30 (-0.18), top 8 of 48 0.21 (-0.16). The keyword score had it level with `kds8` (0.44 against 0.42 at top 2 of 8); it is far worse. Its rejection stands.
+  - Blocks built with the mean question vector (`bq_mean`), clue alone: 0.92, the same as `kds8`'s own 0.92. With another question's vector (`bq_wrong`): clue alone 0.92, top 2 of 8 0.60 (+0.02 +- 0.03). The question vector given to the core does not matter to the reader either (the rater: `s1_r27wmq` in 52), so a fact's 16 tokens can be computed once when the fact is stored.
+- **Caveats.** The judge is the model that wrote the 27B text replies and the training answers of `kd27a` / `kd27b`, so it may favour that style. It sees the clue, so it may pass a reply that names the fact without acting on it. No human labels.
+- **Use.** Report both scores from here on; `judge27.py` after any answer run costs about 0.5 s per reply.
+
+### 55. The reader trained on its own best answers, picked by the 27B judge (V100 box, 2026-11-26)
+
+[poc_selfgen.py](poc_selfgen.py) (sampling added to `fast_gen.py`: temperature 0.8, top-p 0.95), `judge27.py --rows`, logs `v100_sg_0`, `v100_sg_1`, `v100_sg_judge`, `v100_st_train`, `v100_ev_s1a`, `v100_ev_s1b`, `v100_judge_s1`.
+
+- **Data.** 600 fact sets from `read27.json` + `read27far.json` with a relevant fact and 5-8 facts (mean 6.6), in the order training uses; `kd27a` wrote 4 samples each (2,400 answers, 106 min on two GPUs sharing with production). The judge said Yes to 0.55 of the samples and to the best of the 4 in 0.82 of the sets; 492 sets kept (the best sample of each).
+- **Training.** `poc_broad.py train --init lora_kd27a.pt --long --recite --sort --max-facts 8 --batch 4 --minutes 30 --lr 5e-5 --kd 1.0 --mix27 selfkeep.json --p27 0.5 --tag self1`: 863 updates.
+- **Result, judge, 144 questions, difference to `kd27a`:** clue alone 0.97 (-0.01 +- 0.02), top 2 of 8 0.59 (-0.01), top 3 of 8 0.64 (-0.03 +- 0.03), top 4 of 48 0.39 (-0.01), top 8 of 16 0.52 (-0.02 +- 0.04), top 8 of 48 0.28 (-0.10 +- 0.04); clue removed 0.02.
+- **Reading.** No gain anywhere, and a loss at top 8 of 48. Best of 4 at 0.82 against 0.55 for one sample shows room on the training sets, but it does not carry over to the held-out types. Not adopted; `kd27a` stays.
+
+### 56. The video author's Buried Clue test with the current pipeline (V100 box, 2026-11-26)
+
+[demo27.py](demo27.py), logs `v100_demo_extract`, `modal_demo_embed`, `v100_demo_rate`, `v100_demo_answer`; results `work/runs/poc/demo_answers.json`. Sam's 150 chats (memorilla-demos); production's 27B extracts the facts per chat with the prompt of `demos_port.py extract` (562 facts, every clue kept: 3 / 6 / 4 / 6 facts from the clue chats); Qwen3-Embedding-4B on Modal; rater `r27w` on every fact's block; reader `kd27a`.
+
+- **Contamination.** Two of the three buried-clue questions are training questions of the synthetic data ("What should I cook for my parents this Sunday?" with `vegan`, the gym question with `bakery_3am`, both train types); pets is a train type too. So this is a check of the pipeline end to end, not a held-out result.
+- **Rank of the clue chat's best fact among 562** (rater / cosine): getaway 23 / 447, parents dinner 2 / 89, gym 1-3 / 10, control (sister) 1 / 1.
+- **Answers** (rubric of the demo, 27B judge on the clue summary):
+
+| Question | top 1 | top 3 | top 4 | top 8 | clue chat's facts only | top 8, clue chat removed |
+|---|---|---|---|---|---|---|
+| getaway (dog carsick) | fail | fail | fail | fail | fail (judge 0.05) | fail |
+| parents dinner (vegan) | fail | PASS | PASS | PASS | PASS | fail |
+| gym (3 a.m. shift) | fail | PASS | fail (judge 0.67) | PASS | fail (judge 0.81) | fail |
+| control (Priya, March 14) | fail | fail | fail | fail | fail | fail |
+
+- **Reading.**
+  - Original Memorilla, the same test: 0 of 4 at every setting. Now 2 of 3 buried clues pass at the top 3 and at the top 8 of 562.
+  - The control fails on the date: "Priya ... March 17th" at every setting, also from the clue chat's facts only. The name comes back, the exact number does not (as with identifiers in tests 7-10).
+  - The dog clue fails twice: the rater ranks it 23rd, and with only the clue chat's facts the reader names the dog but plans a drive.
+  - Without the clue chat the answers fail, so the passes come from the memory.
 
 ## Caveats
 

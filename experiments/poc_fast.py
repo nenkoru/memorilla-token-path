@@ -84,6 +84,102 @@ def lean_loss_batch(st, items, chunk=256):
     return sum(checkpoint(ce, H[i:i + chunk], Y[i:i + chunk], w[i:i + chunk], use_reentrant=False) for i in range(0, len(Y), chunk))
 
 
+def lora_off(st):
+    """Context manager: the reader's LoRA switched off (scale 0), i.e. the plain decoder, for a teacher pass."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        old = [m.scale for m in st.lora]
+        for m in st.lora:
+            m.scale = 0.0
+        try:
+            yield
+        finally:
+            for m, v in zip(st.lora, old):
+                m.scale = v
+    return cm()
+
+
+def teacher_ids(st, facts, question, answer):
+    """Token ids and the first answer index for the plain decoder reading the facts as text (the text control of
+    poc_broad eval --text: persona prompt, facts then question in the user turn), teacher-forced on `answer`."""
+    from poc_clue import D, PERSONA_PROMPT
+    from memorilla.data import apply_chat_template
+    tok = st.r.tok
+    user = D.user_message(list(facts), question.strip()) if facts else question.strip()
+    msgs = [{"role": "system", "content": PERSONA_PROMPT}, {"role": "user", "content": user}]
+    p_ids = tok.encode(apply_chat_template(tok, msgs, add_generation_prompt=True), add_special_tokens=st.r.add_special)
+    f_ids = tok.encode(apply_chat_template(tok, msgs + [{"role": "assistant", "content": answer}], add_generation_prompt=False),
+                       add_special_tokens=st.r.add_special)
+    assert f_ids[: len(p_ids)] == p_ids
+    return f_ids, len(p_ids)
+
+
+def kd_loss_batch(st, items, teach, alpha=1.0, chunk=256):
+    """lean_loss_batch with distillation from the same 8B reading the facts as text (LoRA off). items as for
+    lean_loss_batch; teach[i] = (facts as text, in block order, the answer without the recite line). Answer tokens:
+    alpha * KL(text teacher || token reader) + (1 - alpha) * cross-entropy; the recite line (tokens before the answer)
+    keeps plain cross-entropy. The student's last tokens must equal the teacher's answer tokens; when they do not
+    (tokenizer seam) that example falls back to cross-entropy only. Returns (loss, number of examples distilled)."""
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import checkpoint
+    from poc_agentmem import P
+    import poc_tok as T
+    model = st.r.model
+    emb = model.get_input_embeddings()
+    pre, suf, tgt, tpre, tsuf, kd_n = [], [], [], [], [], []
+    for (question, mem, answer), (facts, plain) in zip(items, teach):
+        ids, labels = st.ids(question, mem.shape[1], answer)
+        e = P.input_embeds(model, st.r.tok, st.r.memory_id, ids, mem)[0]
+        lab = labels[0].to(e.device)
+        a = int((lab != -100).nonzero()[0])
+        pre.append(e[:a - 1])
+        suf.append(e[a - 1:-1])
+        tgt.append(lab[a:])
+        f_ids, ta = teacher_ids(st, facts, question, plain)
+        n = len(f_ids) - ta  # teacher answer tokens (with the end-of-turn tokens)
+        ok = n <= len(lab) - a and ids[0, -n:].tolist() == f_ids[-n:]
+        kd_n.append(n if ok else 0)
+        if ok:
+            te = emb(torch.tensor([f_ids], device=P.DEV))[0].to(e.dtype)
+            tpre.append(te[:ta - 1])
+            tsuf.append(te[ta - 1:-1])
+    with torch.no_grad(), lora_off(st):
+        ht = T.shared_hidden(model, tpre, tsuf, list(range(len(tpre))), every=True) if tpre else None
+    h = T.shared_hidden(model, pre, suf, list(range(len(items))), every=True)
+    H = torch.cat([h[i, :len(x)] for i, x in enumerate(tgt)])
+    Y = torch.cat(tgt)
+    w = torch.cat([torch.full((len(x),), 1.0 / max(int((x != -100).sum()), 1) / len(tgt), device=H.device) for x in tgt])
+    # teacher rows: aligned to the last kd_n[i] student targets of each example; a mask says which rows have one
+    HT = torch.zeros_like(H)
+    M = torch.zeros(len(Y), device=H.device)
+    off, j = 0, 0
+    for i, x in enumerate(tgt):
+        if kd_n[i]:
+            # ht rows are padded on the right: take this example's own last rows
+            L = len(tsuf[j])
+            HT[off + len(x) - kd_n[i]: off + len(x)] = ht[j, L - kd_n[i]:L]
+            M[off + len(x) - kd_n[i]: off + len(x)] = 1.0
+            j += 1
+        off += len(x)
+    head = model.lm_head
+
+    def part(hc, htc, yc, wc, mc):
+        ls = F.log_softmax(head(hc).float(), -1)
+        ce = -ls.gather(1, yc.clamp(min=0)[:, None])[:, 0] * (yc != -100)
+        with torch.no_grad():
+            lt = F.log_softmax(head(htc).float(), -1)
+        kl = (lt.exp() * (lt - ls)).sum(-1)
+        per = ce * (1 - mc) + mc * (alpha * kl + (1 - alpha) * ce)
+        return (per * wc).sum()
+
+    loss = sum(checkpoint(part, H[i:i + chunk], HT[i:i + chunk], Y[i:i + chunk], w[i:i + chunk], M[i:i + chunk], use_reentrant=False)
+               for i in range(0, len(Y), chunk))
+    return loss, sum(1 for n in kd_n if n)
+
+
 def generate_batch(st, items, max_new):
     import torch
     x, mask, _ = pad_batch(st, [(q, m, None) for q, m in items])

@@ -16,6 +16,7 @@ of 8). This script scales the data about 10x and trains both parts on it:
 
 import argparse
 import json
+import os
 import math
 import random
 import sys
@@ -502,7 +503,7 @@ def cmd_train(args):
     core = st.core.float().eval()
     loss_fn = FB.loss_batch
     if q8.lean():  # 4-bit lean box run: core on the CPU, output layer on the GPU, packed forward + chunked loss
-        core = core.cpu()
+        core = q8.place_core(core)
         q8.head_to_gpu(st.r.model)
         FT.fast_lora(st.lora)  # branch in fp16, no dropout
         loss_fn = FB.lean_loss_batch
@@ -550,24 +551,70 @@ def cmd_train(args):
             ans = f"Relevant fact: {fact if with_fact else 'none'}"
         elif args.recite:  # H19: first restate the fact that matters (or none), then answer
             ans = f"Relevant fact: {fact if with_fact else 'none'}\n{ans}"
+        if args.kd is not None:  # distillation: the same facts as text, in block order, for the plain-decoder teacher
+            plain = answer if with_fact else generic
+            if args.kd_clean:  # the teacher reads only the fact that matters (nothing when it is absent): no distractors
+                return (request + suffix, mem, ans), ([fact] if with_fact else [], plain)
+            return (request + suffix, mem, ans), ([pool[i] for i in idx], plain)
         return request + suffix, mem, ans
 
+    ex27 = []
+    if args.mix27:  # test 51: fact sets answered by the 27B (poc_read27.py); plain cross-entropy, no 8B teacher on these
+        ex27 = [r for r in json.loads((K.OUT / args.mix27).read_text())["rows"]
+                if r["request"] in qvec and all(f in fvec for f in r["facts"]) and len(r["answer"].split()) >= 20]
+        print(f"BROADTRAIN 27B-answered fact sets {len(ex27)} ({sum(r['relevant'] is None for r in ex27)} with no relevant fact), share of batches {args.p27}", flush=True)
+
+    def item27():
+        r = rng.choice(ex27)
+        order = list(range(len(r["facts"])))
+        if args.sort:  # by the 27B's score, as the rater would; half the time the relevant fact sits anywhere (the rater misses too)
+            order.sort(key=lambda i: -r["scores"][i])
+            if r["relevant"] is not None and rng.random() < 0.5:
+                k = order.pop(next(j for j, i in enumerate(order) if r["facts"][i] == r["relevant"]))
+                order.insert(rng.randint(0, len(order)), k)
+        else:
+            rng.shuffle(order)
+        with torch.no_grad():
+            mem = PF.blocks(C, core, np.stack([fvec[r["facts"][i]] for i in order]).astype(np.float32), qvec[r["request"]], 16, P, torch).to(dt)
+        ans = f"Relevant fact: {r['relevant'] or 'none'}\n{r['answer']}" if args.recite else r["answer"]
+        return r["request"] + suffix, mem, ans
+
     st.r.model.train()
-    t0, u, run = time.perf_counter(), 0, []
+    t0, u, run, kd_seen = time.perf_counter(), 0, [], [1.0]
+    timing, spent = os.environ.get("MPORT_TIMING") == "1", np.zeros(3)  # seconds: building the batch (CPU core), forward, backward
     budget = args.minutes * 60
     while time.perf_counter() - t0 < budget:
         frac = min(1.0, (time.perf_counter() - t0) / budget)
         for g in opt.param_groups:
             g["lr"] = g["base"] * min(1.0, (u + 1) / 20) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * frac)))
-        loss = loss_fn(st, [item() for _ in range(args.batch)])
+        ta = time.perf_counter()
+        if ex27 and rng.random() < args.p27:
+            its = [item27() for _ in range(args.batch)]
+            tb = time.perf_counter()
+            loss = loss_fn(st, its)
+            kd_seen.append(0.0)
+        elif args.kd is not None:
+            its = [item() for _ in range(args.batch)]
+            tb = time.perf_counter()
+            loss, nkd = FB.kd_loss_batch(st, [a for a, _ in its], [b for _, b in its], args.kd)
+            kd_seen.append(nkd / args.batch)
+        else:
+            its = [item() for _ in range(args.batch)]
+            tb = time.perf_counter()
+            loss = loss_fn(st, its)
+        if timing:
+            torch.cuda.synchronize()
+        tc = time.perf_counter()
         loss.backward()
         run.append(loss.item())
+        spent += np.array([tb - ta, tc - tb, time.perf_counter() - tc])
         torch.nn.utils.clip_grad_norm_(lps, 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
         u += 1
         if u % 50 == 0 or u in (1, 5):
-            print(f"update {u}  examples {u * args.batch}  loss {np.mean(run[-50:]):.3f}  {(time.perf_counter() - t0) / 60:.1f} min  peak {torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0:.2f} GiB", flush=True)
+            print(f"update {u}  examples {u * args.batch}  loss {np.mean(run[-50:]):.3f}  distilled {np.mean(kd_seen[-50:]):.2f}  {(time.perf_counter() - t0) / 60:.1f} min  peak {torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0:.2f} GiB"
+                  f"  per update: batch {spent[0] / u:.2f}s forward {spent[1] / u:.2f}s backward {spent[2] / u:.2f}s{'' if timing else ' (forward not synced)'}", flush=True)
     torch.save(st.state(), OUT / f"lora_{args.tag}.pt")
     if delta is not None:
         torch.save({"rank": args.delta, "state": {k: v.cpu() for k, v in delta.state_dict().items()}}, OUT / f"lora_{args.tag}.delta.pt")
@@ -581,7 +628,8 @@ def cmd_train(args):
         p_none, args.p_none = args.p_none, 0.0
         with torch.no_grad():
             chk = [item() for _ in range(64)]
-            outs = FB.generate_batch(st, [(a, b) for a, b, _ in chk], 40)
+            chk = [c[0] if args.kd is not None else c for c in chk]
+            outs = [o for i in range(0, len(chk), 16) for o in FB.generate_batch(st, [(a, b) for a, b, _ in chk[i:i + 16]], 40)]
         args.p_none = p_none
         none = np.mean([o.strip().lower().startswith("relevant fact: none") for o in outs])
         same = np.mean([o.strip().splitlines()[0].strip() == t.splitlines()[0].strip() if o.strip() else False for o, (_, _, t) in zip(outs, chk)])
@@ -755,6 +803,10 @@ def main():
     t.add_argument("--long", action="store_true")
     t.add_argument("--restate", action="store_true")
     t.add_argument("--max-facts", type=int, default=3)
+    t.add_argument("--kd-clean", action="store_true", help="with --kd: the teacher reads only the relevant fact as text, the reader still gets every block")
+    t.add_argument("--kd", type=float, default=None, help="distil answer tokens from the plain decoder reading the facts as text: weight of KL vs cross-entropy (lean box runs only)")
+    t.add_argument("--mix27", default="", help="test 51: a poc_read27.py output; that share (--p27) of the batches trains on the 27B's answers")
+    t.add_argument("--p27", type=float, default=0.5)
     t.add_argument("--delta", type=int, default=0)
     t.add_argument("--delta-lr", type=float, default=3e-4)
     t.add_argument("--map", default="relmap_broad.pt")

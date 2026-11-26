@@ -22,6 +22,11 @@ case $cmd in
     name=$1; gpu=$2; script=$3; shift 3
     $0 sync || exit 1
     $S $H "cd ~/train/proj || exit 1; $E CUDA_VISIBLE_DEVICES=$gpu MPORT_SCRATCH=\$HOME/train/work MEMORILLA_REPO=\$HOME/train/proj/repo/memorilla HF_HOME=\$HOME/train/hf HF_HUB_OFFLINE=1 MPORT_DTYPE=float16 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1 nohup sh -c '../.venv/bin/python -I experiments/modal_entry.py $script $*; echo V100_DONE $name exit \$?' > ../work/logs/v100_$name.log 2>&1 < /dev/null & echo started $name on gpu $gpu" ;;
+  chain)
+    # chain <wait-for-job|-> <name> <gpu> <script> <args...>: like run, but the wait and the start happen on the box
+    waitfor=$1; name=$2; gpu=$3; shift 3
+    $0 sync || exit 1
+    $S $H "nohup bash \$HOME/train/proj/experiments/box_chain.sh $waitfor $name $gpu \"$E\" $* > /dev/null 2>&1 < /dev/null & echo chained $name after $waitfor" ;;
   ddp)
     # one training run on both GPUs (data parallel): ranks 0 and 1, logs v100_<name>.log and v100_<name>_r1.log
     name=$1; shift

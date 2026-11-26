@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--out", default="lora_tokrater.pt")
     ap.add_argument("--layout", default="sys", choices=["sys", "qfirst"], help="memory in the system prompt (original) or after the request")
     ap.add_argument("--shared", type=int, default=1, help="1: each request's prefix computed once for its facts (T.shared_hidden)")
+    ap.add_argument("--seed", type=int, default=0, help="training-order seed (0: the original order)")
     ap.add_argument("--init", default="", help="start from this LoRA (in runs/agentmem) instead of a fresh one")
     ap.add_argument("--lora-from", type=int, default=0, help="LoRA only on layers >= this; backward then stops there (cheaper step)")
     ap.add_argument("--check", action="store_true", help="before training: shared-prefix scores vs the plain forward on one val group (layout sys)")
@@ -69,6 +70,8 @@ def main():
     reqs = sorted(q for q, v in by.items() if len(v) >= args.per)
     val = rng.sample(reqs, args.val)
     tr = [q for q in reqs if q not in set(val)]
+    if args.seed:  # another training order (which requests, which facts per step); the val split stays the same
+        rng = random.Random(args.seed)
     print(f"TOKRATER {len(rows)} rated pairs, {len(tr)} train / {len(val)} val requests", flush=True)
 
     st = A.Stack("lora", train=True)  # fresh LoRA, B = 0: starts as the plain decoder (the 46% / 38% baseline)
@@ -77,7 +80,7 @@ def main():
     FT.fast_lora(st.lora)  # no dropout, branch in the model's dtype
     core = st.core.float().eval()
     if q8.lean():  # the memory core runs on the CPU (no gradient, a few vectors per step): 0.8 GB less on the GPU
-        core = core.cpu()
+        core = q8.place_core(core)
     cdev = next(core.parameters()).device
     model, tok = st.r.model, st.r.tok
     dt = next(model.parameters()).dtype

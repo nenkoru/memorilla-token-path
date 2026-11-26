@@ -100,6 +100,14 @@ class Int4Linear(torch.nn.Module):
         self.low.copy_(lo.to(self.low.dtype))
 
     def dequant(self, dtype):
+        if _FP16:  # MPORT_Q4_FP16=1: unpack once and keep (2 bytes per weight on the GPU; for a GPU with ~17 GB free)
+            w = self.__dict__.get("_w")
+            if w is None or w.dtype != dtype:
+                w = self.__dict__["_w"] = self._unpack(dtype)
+            return w
+        return self._unpack(dtype)
+
+    def _unpack(self, dtype):
         p, s, lo = self.weight, self.scale, self.low
         if p.device != self.dev:  # offloaded: this layer's packed weights, copied in ahead of time by the prefetcher
             cache = getattr(self, "cache", None)
@@ -165,11 +173,25 @@ class _Int4MM(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, mod):
         ctx.mod = mod
-        return x @ mod.dequant(x.dtype).t()
+        w = mod.dequant(x.dtype)
+        # MPORT_Q4_REUSE=1 (training with every layer checkpointed): the pass that is differentiated keeps the unpacked
+        # weight for its own backward, which follows at once, so each layer unpacks 3 times per step instead of 4.
+        # Costs one layer's fp16 weights (~0.4 GB) at the peak. Never use it without per-layer checkpointing.
+        # It must go through save_for_backward: the checkpoint's first pass runs with gradients on and drops only what is
+        # saved that way (a plain attribute on ctx would keep every layer's weights alive: 13 GB for the 8B).
+        if _REUSE and ctx.needs_input_grad[0] and getattr(mod, "reuse", True):
+            ctx.save_for_backward(w)
+        return x @ w.t()
 
     @staticmethod
     def backward(ctx, g):
-        return g @ ctx.mod.dequant(g.dtype), None
+        saved = ctx.saved_tensors
+        w = saved[0] if saved else ctx.mod.dequant(g.dtype)
+        return g @ w.to(g.dtype), None
+
+
+_REUSE = os.environ.get("MPORT_Q4_REUSE") == "1"
+_FP16 = os.environ.get("MPORT_Q4_FP16") == "1"
 
 
 def bits():
@@ -257,6 +279,7 @@ def load(model_id, dev, dtype=None):
                 for m in layer.modules():
                     if isinstance(m, Int4Linear):
                         m.cache, m.L = cache, L
+            cache.warm()
     if getattr(cfg, "tie_word_embeddings", False):
         model.lm_head.weight = model.model.embed_tokens.weight
     want = {k for k in model.state_dict() if not k.endswith((".scale", ".low", ".anchor"))}
@@ -353,13 +376,31 @@ class CpuLinear(torch.nn.Module):
 class LayerPrefetch:
     """GPU copies of a few layers' packed 4-bit weights (MPORT_OFFLOAD=1). Using layer L waits for its copy and starts
     copying L - 1 and L + 1 on a side stream, so the transfer runs behind the compute in both the forward pass and the
-    backward pass (which recomputes and differentiates the layers in reverse order). Keeps at most `keep` layers."""
+    backward pass (which recomputes and differentiates the layers in reverse order). Keeps at most `keep` layers, plus
+    the first MPORT_RESIDENT_LAYERS layers, which are copied once and stay (0.10 GiB each for the 8B): for the GPU memory
+    that is free beyond the working set, so that fewer bytes cross the bus per pass."""
 
     def __init__(self, mods, dev, keep=4):
         import collections
         self.mods, self.dev, self.keep = mods, dev, keep
+        self.fixed = int(os.environ.get("MPORT_RESIDENT_LAYERS", "0"))
+        # other people's jobs share this GPU: when its free memory falls under this, the resident layers are given back
+        self.min_free = float(os.environ.get("MPORT_MIN_FREE_GB", "1.5")) * 2**30
         self.stream = torch.cuda.Stream(dev)
         self.have = collections.OrderedDict()  # layer -> (event, {id(module): (packed, scale, low)})
+
+    def warm(self):
+        """Copy the resident layers now, so that what is measured as free memory afterwards is really free."""
+        for L in range(min(self.fixed, len(self.mods))):
+            self._fetch(L)
+        torch.cuda.synchronize(self.dev)
+
+    def _yield(self):
+        if torch.cuda.mem_get_info(self.dev)[0] < self.min_free:
+            print(f"q8: {torch.cuda.mem_get_info(self.dev)[0] / 2**30:.1f} GiB free on the GPU: giving back the {self.fixed} resident layers", flush=True)
+            self.fixed = 0
+            self.have.clear()
+            torch.cuda.empty_cache()
 
     def _fetch(self, L):
         if L in self.have or not 0 <= L < len(self.mods):
@@ -378,6 +419,8 @@ class LayerPrefetch:
         self.have[L] = (ev, got)
 
     def get(self, L):
+        if L == 0 and self.fixed:  # once per pass
+            self._yield()
         self._fetch(L)
         ev, got = self.have[L]
         self.have.move_to_end(L)
@@ -385,8 +428,8 @@ class LayerPrefetch:
         nxt = (L + 1) % len(self.mods)  # after the last layer comes layer 0 again (next decoding step, next forward)
         for n in (nxt, L - 1):
             self._fetch(n)
-        while len(self.have) > self.keep:
-            old = next(iter(self.have))
+        while sum(k >= self.fixed for k in self.have) > self.keep:
+            old = next(k for k in self.have if k >= self.fixed)
             if old in (L - 1, L, nxt):
                 break
             del self.have[old]
@@ -400,6 +443,12 @@ def offload():
 
 def lean():
     return os.environ.get("MPORT_LEAN") == "1"
+
+
+def place_core(core):
+    """Where the memory core runs in a lean run. Default: the CPU (frees ~0.4 GB of GPU). MPORT_CORE_GPU=1 leaves it on
+    the GPU: on a box whose CPUs are oversubscribed the CPU core was half of every training step (4.8 s of 9.8 s)."""
+    return core if os.environ.get("MPORT_CORE_GPU") == "1" else core.cpu()
 
 
 def make_lean(model):
@@ -428,6 +477,7 @@ class SlicedHead(torch.nn.Module):
             m.fill(table[a:b])  # quantized on the CPU: no fp32 transient on the GPU
             m.to(dev)
             m.dev = torch.device(dev)
+            m.reuse = False  # MPORT_Q4_REUSE: the output layer's slices are not kept (10 of them would be 1.2 GB)
             self.parts.append(m)
 
     def forward(self, x):
